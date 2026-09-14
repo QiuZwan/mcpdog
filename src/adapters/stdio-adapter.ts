@@ -28,6 +28,7 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
   private isBlacklisted: boolean = false; // Whether blacklisted
   private blacklistUntil: number = 0; // Blacklist release time
   private isDisabled: boolean = false; // Whether disabled, should not auto-reconnect if disabled
+  private connectingPromise?: Promise<void>; // 进行中的握手：并发调用合流，避免重复 spawn 出多个子进程
 
   constructor(name: string, config: MCPServerConfig) {
     super();
@@ -39,10 +40,28 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
     }
   }
 
+  /**
+   * 子进程是否真的可用。
+   * 这是判断连接是否可用的唯一权威依据：`isConnected` 标志位与 `'exit'` 事件之间存在时序窗口
+   * （`exitCode` 在 libuv 回调里同步置位，而 `'exit'` 事件要等到 nextTick 才发出），
+   * 只凭标志位判断会得到「已连接」的错误结论，进而把请求写进已断开的管道。
+   */
+  private isProcessAlive(): boolean {
+    return !!this.process && !this.process.killed && this.process.exitCode === null && !!this.process.stdin;
+  }
+
   async connect(): Promise<void> {
     if (this.isConnected) {
-      console.error(`[${this.name}] Already connected, skipping connect() call.`);
-      return;
+      if (this.isProcessAlive()) {
+        console.error(`[${this.name}] Already connected, skipping connect() call.`);
+        return;
+      }
+      // 标志位说已连接、进程却已死：复位后按重连处理，否则调用方会误判为重连成功
+      const staleMsg = 'Connection flag was stale (process already dead), forcing reconnect';
+      console.error(`[${this.name}] ${staleMsg}`);
+      globalLogManager.addLog(this.name, 'warn', staleMsg, 'system');
+      this.isConnected = false;
+      this.cleanup();
     }
 
     if (this.isDisabled) {
@@ -60,8 +79,27 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
       throw new Error('Command is required for stdio transport');
     }
 
+    // 并发合流：握手期间 isConnected 仍为 false，多个调用方会同时走到这里。
+    // 不加闩会各自 spawn 一个子进程，后一个覆盖 this.process，前一个成为无人回收的孤儿。
+    if (this.connectingPromise) {
+      return this.connectingPromise;
+    }
+
+    this.connectingPromise = this.doConnect();
     try {
-      console.error(`[${this.name}] Attempting to connect via stdio: ${this.config.command} ${this.config.args?.join(' ') || ''}`);
+      await this.connectingPromise;
+    } finally {
+      this.connectingPromise = undefined;
+    }
+  }
+
+  /** 建立连接并完成 initialize 握手；守卫与并发合流由 connect() 负责 */
+  private async doConnect(): Promise<void> {
+    // connect() 已校验 command 必存在；取本地引用以便 spawn 处保持 TS 窄化
+    const command = this.config.command!;
+
+    try {
+      console.error(`[${this.name}] Attempting to connect via stdio: ${command} ${this.config.args?.join(' ') || ''}`);
 
       // Environment variable debug log
       this.logEnvironmentVariables();
@@ -105,7 +143,7 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
         }
       }
       
-      this.process = spawn(this.config.command, this.config.args || [], spawnOptions);
+      this.process = spawn(command, this.config.args || [], spawnOptions);
 
       this.setupProcessHandlers();
       
@@ -332,7 +370,9 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
       }
     };
 
-    const response = await this.sendRequest(initRequest);
+    // 握手期间不做「死进程重连」：initialize 是在 connect()/doConnect() 内部调用的，
+    // 若此处再走重连分支会递归回 connect()，加了并发闩后会 await 到自己而死锁。
+    const response = await this.sendRequest(initRequest, { reconnect: false });
     
     if (response.error) {
       throw new Error(`Initialize failed: ${response.error.message}`);
@@ -402,26 +442,39 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
     }
   }
 
-  async sendRequest(request: MCPRequest): Promise<MCPResponse> {
+  /**
+   * 发送请求。
+   * @param options.reconnect 进程已死时是否尝试重连，默认 true。
+   *   initialize 握手内部必须传 false —— 它本身就在 connect() 内部执行，
+   *   再走重连分支会递归回 connect()（加了并发闩后会 await 到自己而死锁）。
+   */
+  async sendRequest(request: MCPRequest, options: { reconnect?: boolean } = {}): Promise<MCPResponse> {
     // Add detailed debug logging for troubleshooting
     console.error(`[${this.name}] DEBUG: sendRequest called - method: ${request.method}, id: ${request.id}`);
     globalLogManager.addLog(this.name, 'info', `DEBUG: Sending request ${request.method} (ID: ${request.id})`, 'system');
-    
+
     // Check process status, try to reconnect if dead
-    if (!this.process?.stdin || this.process.killed || this.process.exitCode !== null) {
+    if (options.reconnect !== false && !this.isProcessAlive()) {
       console.error(`${this.name} process is dead, attempting reconnection...`);
       globalLogManager.addLog(this.name, 'warn', 'Process is dead, attempting reconnection...', 'system');
       try {
         await this.connect();
-        globalLogManager.addLog(this.name, 'info', 'Reconnection successful', 'system');
       } catch (error) {
         const errorMsg = `Failed to reconnect to ${this.name}: ${(error as Error).message}`;
         globalLogManager.addLog(this.name, 'error', errorMsg, 'system');
         throw new Error(errorMsg);
       }
+      // connect() 在标志位为真时可能直接返回，因此必须复核进程是否真的可用；
+      // 否则「重连成功」是假的，请求会被写进已断开的管道，直到 30s 超时才失败。
+      if (!this.isProcessAlive()) {
+        const errorMsg = `Failed to reconnect to ${this.name}: process is still unavailable after reconnect attempt`;
+        globalLogManager.addLog(this.name, 'error', errorMsg, 'system');
+        throw new Error(errorMsg);
+      }
+      globalLogManager.addLog(this.name, 'info', 'Reconnection successful', 'system');
     }
-    
-    if (!this.process?.stdin) {
+
+    if (!this.isProcessAlive()) {
       const errorMsg = `Not connected to ${this.name}`;
       globalLogManager.addLog(this.name, 'error', errorMsg, 'system');
       throw new Error(errorMsg);
@@ -482,22 +535,26 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
   }
 
   private cleanup(): void {
-    if (this.process) {
+    // 必须捕获当前进程引用：延迟强杀的定时器读的是闭包里的这个对象，
+    // 若读 this.process，2 秒内若已完成重连就会把「新进程」SIGKILL 掉
+    // （生产日志里「刚 spawn 就被 SIGKILL」正是这个原因）。
+    const target = this.process;
+    if (target) {
       try {
-        if (!this.process.killed) {
-          this.process.kill('SIGTERM');
+        if (!target.killed) {
+          target.kill('SIGTERM');
         }
-        
+
         // If process does not end within 2 seconds, force kill
         setTimeout(() => {
-          if (this.process && !this.process.killed) {
-            this.process.kill('SIGKILL');
+          if (!target.killed) {
+            target.kill('SIGKILL');
           }
         }, 2000);
       } catch (error) {
         console.error(`Error killing process for ${this.name}:`, error);
       }
-      
+
       this.process = undefined;
     }
 

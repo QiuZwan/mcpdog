@@ -11,6 +11,47 @@ import {
   MCPServerConfig 
 } from '../types/index.js';
 
+/**
+ * 影响「连接本身」的配置字段。只有这些字段变化才需要重建 adapter 并重连。
+ * 其余字段（tools / connected / toolCount / enabledToolCount / description / adminUrl 等）
+ * 只影响展示与工具过滤，改动不应打断已有连接。
+ */
+const CONNECTION_CONFIG_FIELDS = [
+  'transport',
+  'command', 'args', 'cwd', 'env',
+  'url', 'endpoint', 'apiKey', 'headers',
+  'sseReconnectInterval', 'httpKeepAlive', 'sseEndpoint',
+  'maxChunkSize', 'streamTimeout', 'streamEndpoint',
+  'sessionMode',
+  'timeout', 'retries',
+] as const;
+
+/** 稳定的序列化：对象键排序后展开，避免键顺序不同导致误判为「配置已变」 */
+function canonicalize(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value ?? null);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalize).join(',')}]`;
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalize(v)}`).join(',')}}`;
+}
+
+/** 两个 server 配置在「连接」维度上是否等价（逐字段显式比较，不做整体深比较） */
+function isSameConnectionConfig(a: MCPServerConfig, b: MCPServerConfig): boolean {
+  const left = a as unknown as Record<string, unknown>;
+  const right = b as unknown as Record<string, unknown>;
+  return CONNECTION_CONFIG_FIELDS.every((field) => canonicalize(left[field]) === canonicalize(right[field]));
+}
+
+/** 工具开关是否等价：变化只需刷新工具路由，不需要重连 */
+function isSameToolsConfig(a: MCPServerConfig['toolsConfig'], b: MCPServerConfig['toolsConfig']): boolean {
+  return canonicalize(a ?? null) === canonicalize(b ?? null);
+}
+
 export class MCPDogServer extends EventEmitter {
   private configManager: ConfigManager;
   private toolRouter: ToolRouter;
@@ -265,25 +306,69 @@ export class MCPDogServer extends EventEmitter {
 
   
 
+  /**
+   * 配置变更后按需重建 adapter：只重建「新增 / 连接参数变化 / 已删除」的 server，
+   * 其余 server 保持现有连接不动。
+   *
+   * 此前是无条件移除并重建全部 adapter，导致改任意一个 server 都会让其他所有 server
+   * 断连重连（外部 MCP 工具会话、SSH 连接等全部被打断）。文件监听路径
+   * （ConfigManager.reloadAndNotifyConfig）广播的 'config-updated' 不带 context，
+   * 无法靠 changeType 区分，因此这里改为按配置内容比对。
+   */
   private async reinitializeAdapters(): Promise<void> {
-    // Stop all existing adapters
-    const existingAdapters = this.toolRouter.getAllAdapters();
-    for (const adapter of existingAdapters) {
-      this.toolRouter.removeAdapter(adapter.name);
-    }
-
-    // Reinitialize adapters
     const enabledServers = this.configManager.getEnabledServers();
-    for (const [serverName, serverConfig] of Object.entries(enabledServers)) {
-      try {
-        const adapter = AdapterFactory.createAdapter(serverName, serverConfig);
-        this.setupAdapterEvents(adapter);
-        this.toolRouter.addAdapter(adapter);
-      } catch (error: any) {
-        console.error(`Failed to create adapter ${serverName} during reinitialization:`, error);
+    const existing = new Map(this.toolRouter.getAllAdapters().map((adapter) => [adapter.name, adapter]));
+
+    // 1) 配置中已不存在（或已禁用）的 server：移除 adapter
+    for (const name of Array.from(existing.keys())) {
+      if (!(name in enabledServers)) {
+        this.toolRouter.removeAdapter(name);
+        existing.delete(name);
       }
     }
-    this.connectAdaptersInBackground();
+
+    // 2) 逐 server 比对：连接参数变了才重建；只有工具开关变了则只刷新路由
+    let connectionChanged = false;
+    for (const [serverName, serverConfig] of Object.entries(enabledServers)) {
+      const current = existing.get(serverName);
+
+      if (!current) {
+        console.error(`[SERVER] New server ${serverName}, creating adapter`);
+        try {
+          await this.createAndAddAdapter(serverName, serverConfig);
+          connectionChanged = true;
+        } catch (error) {
+          console.error(`Failed to create adapter for new server ${serverName}:`, error);
+        }
+        continue;
+      }
+
+      if (!isSameConnectionConfig(current.config, serverConfig)) {
+        console.error(`[SERVER] Connection config changed for ${serverName}, recreating adapter`);
+        this.toolRouter.removeAdapter(serverName);
+        try {
+          await this.createAndAddAdapter(serverName, serverConfig);
+          connectionChanged = true;
+        } catch (error) {
+          console.error(`Failed to recreate adapter ${serverName} after config change:`, error);
+        }
+        continue;
+      }
+
+      if (!isSameToolsConfig(current.config.toolsConfig, serverConfig.toolsConfig)) {
+        console.error(`[SERVER] Tool config changed for ${serverName}, refreshing tool routes only`);
+        this.toolRouter.updateServerTools(serverName).catch((error: any) => {
+          console.error(`Failed to refresh tools for ${serverName}:`, error);
+        });
+      }
+    }
+
+    // 3) 仅当确有连接参数变化时才发起连接（connectAll 会跳过仍处于连接态的 adapter）
+    if (connectionChanged) {
+      this.connectAdaptersInBackground();
+    } else {
+      console.error('[SERVER] No connection-relevant config change, keeping existing connections');
+    }
   }
 
   private async handleConfigUpdate(): Promise<void> {

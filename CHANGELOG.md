@@ -2,6 +2,15 @@
 
 本项目所有显著变更都会记录在此文件中。
 
+## [1.0.9] - 2026-09-14
+
+- **修复（关键）**：下游 stdio server 进程异常退出后重连失效。`sendRequest` 判定进程已死并调用 `connect()`，但 `connect()` 顶部的 `isConnected` 守卫在标志位陈旧时直接 `return`（且只 `console.error`、不写日志管理器，界面上看不到），调用方随即无条件记录「Reconnection successful」——**日志说重连成功，请求却被写进已断开的管道，最终要等 30 秒超时才失败**。根因是 `isConnected` 与进程 `'exit'` 事件之间存在时序窗口（`exitCode` 在 libuv 回调里同步置位，`'exit'` 事件要等 nextTick 才发出）。现改为以进程实况（`process`/`stdin`/`killed`/`exitCode`）作为唯一权威判据，标志位陈旧时复位并清理后走重连，重连后再复核一次进程可用性，不再假报成功。
+- **修复（关键）**：`cleanup()` 的延迟强杀会杀掉**新**进程。定时器 2 秒后读的是 `this.process` 的**当前值**而非它当时要杀的那个进程，若期间已完成重连，刚 spawn 的新进程会被 SIGKILL——这正是线上日志里「刚连上就 `Process exited ... signal SIGKILL`」的成因。现改为捕获当时的进程引用。
+- **修复**：任一下游 server 配置变更会触发**全部** server 断连重连。文件监听路径广播的 `config-updated` 不带 context，必然落到 `handleConfigUpdate` 的全量重建分支，改一个 server 会让其他所有 server（外部 MCP 工具会话、SSH 连接等）一并被打断。现按配置内容比对，只重建「新增 / 连接参数变化 / 已删除」的 server；仅工具开关（`toolsConfig`）变化只刷新工具路由；无连接相关变化则完全不动已有连接。连接维度用显式字段白名单比较，避免被 `tools`/`connected`/`toolCount` 等会被回写的易变字段误判。
+- **优化**：`initialize()` 不再走「死进程重连」分支（新增 `sendRequest` 的 `reconnect` 选项），切断 `connect → initialize → sendRequest → connect` 相互递归。
+- **优化**：`connect()` 增加进行中握手合流（`connectingPromise`），避免多个并发调用各自 spawn 出一个子进程、后一个覆盖 `this.process` 使前一个成为无人回收的孤儿。
+- **测试**：新增 `src/adapters/stdio-adapter.test.ts`（死进程标志位陈旧时必须真正重连、重连仍不可用时快速失败）与 `src/core/mcpdog-server.test.ts`（首次初始化、只改一个 server 只重建它、只改工具开关不重连、移除 server 只摘它），两组用例均已确认在修复前的代码上失败。
+
 ## [1.0.8] - 2026-09-09
 
 - **新增**：Web 管理界面「连接 MCPDOG」旁新增「一键导入 Claude MCP」按钮，读取 `C:\Users\<用户名>\.claude.json` 顶层的用户级 `mcpServers` 批量导入到 MCPDog。先预览「将导入 / 将跳过」清单再确认；同名冲突跳过、名称不合规或缺 `command`/`url` 的条目跳过并注明原因，`disabled` 条目按禁用状态导入；导入成功的启用服务器自动连接。读取与转换在 daemon 本机完成（浏览器无法直接访问用户主目录文件），导入逻辑抽离为纯函数模块 `claude-mcp-importer` 并补齐单测。
