@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 两个平台各自独立上报，一个挂了另一个的结论仍然可见
+      fail-fast: false
+      matrix:
+        # 本项目的核心价值之一就是 Windows 兼容（子服务器多为 npx/.cmd、桌面版仅 Windows），
+        # 所以 Windows 必须跑；Ubuntu 用来尽早发现与平台无关的回归。
+        os: [ubuntu-latest, windows-latest]
+
+    env:
+      # 依赖里有 puppeteer 与 @playwright/mcp，默认 postinstall 会下载 Chromium。
+      # 测试不需要浏览器，跳过下载可以显著缩短 CI 时间并避免下载失败导致的红。
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+
+      - name: Install dependencies
+        # web/ 是独立的前端工程，有自己的 lock 文件，构建时需要单独安装
+        run: |
+          npm ci
+          npm ci --prefix web
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npx vitest run
+
+      - name: Integration tests
+        # 会真起 daemon、绑定回环端口并 spawn stdio proxy，故需串行执行
+        run: npx vitest run --config vitest.integration.config.ts
+
+      - name: Build
+        run: npm run build

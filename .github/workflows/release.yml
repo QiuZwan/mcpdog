@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # 桌面壳（Windows 托盘应用）尚未落地 —— 见 docs/superpowers/plans/2026-09-18-mcpdog-windows-shell.md。
+  # 用它是否存在来决定要不要跑打包 job：现在就是绿的，等壳的源码进仓库后自动生效，
+  # 不需要那时候再来改这份 workflow。
+  detect-shell:
+    runs-on: ubuntu-latest
+    outputs:
+      present: ${{ steps.check.outputs.present }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          if [ -f src-tauri/tauri.conf.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "未检测到 src-tauri/tauri.conf.json，跳过桌面壳打包。" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    env:
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm ci --prefix web
+
+      - name: Verify before publishing
+        # 发版前必须过闸：npm 的版本一旦发布，撤回窗口极短且不可靠
+        run: |
+          npx tsc --noEmit
+          npx vitest run
+          npx vitest run --config vitest.integration.config.ts
+
+      - name: Publish
+        # package.json 的 prepublishOnly 会执行 npm run build（含前端构建），
+        # 因此 dist/ 与 web/dist/ 都是本次源码构建的产物
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  shell-installer:
+    name: Build Windows installer
+    needs: detect-shell
+    if: needs.detect-shell.outputs.present == 'true'
+    runs-on: windows-latest
+    env:
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm ci --prefix web
+
+      - name: Build app and prepare embedded resources
+        # 一次构建两处：npm 包与安装包内嵌的 dist 同源同版本，
+        # 否则会出现「壳里是 1.1.0、用户 npx 到的是 1.2.0」的漂移
+        run: |
+          npm run build
+          npm run shell:resources
+
+      - name: Build installer
+        run: npx --yes @tauri-apps/cli build
+        working-directory: src-tauri
+        env:
+          # 私钥必须与 src-tauri/tauri.conf.json 的 plugins.updater.pubkey 配对，
+          # 否则客户端升级验签失败。密钥由桌面壳的实施阶段生成（见该计划的 Task 6）。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/latest.json
