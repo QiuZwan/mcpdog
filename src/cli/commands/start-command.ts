@@ -266,8 +266,8 @@ ${CLIUtils.colorize('Options:', 'yellow')}
   --daemon-port <port>       IPC daemon port (default: 9999)
   --pid-file <path>          PID file location (default: ~/.mcpdog/mcpdog.pid)
   
-  --stdio-only               Only enable stdio transport + dashboard
-  --no-dashboard             Disable dashboard UI (and the /mcp endpoint)
+  --stdio-only               No-op, kept for compatibility (stdio is always on)
+  --no-dashboard             Disable dashboard UI (and the /mcp endpoint); no listening port is opened
   
   --web-port <port>          Deprecated, use --dashboard-port
   --mcp-http-port <port>     Deprecated and ignored, /mcp shares the dashboard port
@@ -281,8 +281,8 @@ ${CLIUtils.colorize('Default Behavior:', 'yellow')}
 
 ${CLIUtils.colorize('Examples:', 'yellow')}
   mcpdog start                              # Start all services
-  mcpdog start --stdio-only                 # Only stdio + dashboard
-  mcpdog start --no-dashboard               # Stdio only, no dashboard
+  mcpdog start --stdio-only                 # No-op, same as plain 'mcpdog start'
+  mcpdog start --no-dashboard               # Stdio only, no listening port
   mcpdog start --dashboard-port 3001        # Custom dashboard/MCP port
 
 ${CLIUtils.colorize('After starting:', 'yellow')}

@@ -2,6 +2,15 @@
 
 本项目所有显著变更都会记录在此文件中。
 
+## [1.1.0] - 2026-09-18
+
+- **新增**：daemon 内建 StreamableHTTP `/mcp` 端点，与 dashboard 同端口（默认 38881）。客户端改用 URL 接入常驻服务，无需为每次会话拉起子进程；配置热更新后会向已连接的会话推送 `notifications/tools/list_changed`，支持该通知的客户端无需重启即可刷新工具清单。
+- **变更（破坏性，需用户注意）**：dashboard 与 `/mcp` 仅监听 `127.0.0.1`，不再允许局域网访问（此前 dashboard 可被同网段其他机器打开）。如需远程访问请自建反向代理。
+- **变更（破坏性，需用户注意）**：`mcpdog proxy --transport streamable-http` 与 `mcpdog --transport streamable-http` 已移除，执行时打印改用 `daemon start` 的指引并以非零码退出。
+- **变更（破坏性，需用户注意）**：`mcpdog start --mcp-http-port` 弃用（告警并忽略，`/mcp` 固定与 dashboard 同端口），`mcpdog start --http-only` 移除（`/mcp` 与 dashboard 同端口，无法只开 HTTP 传输）。
+- **变更**：接入配置生成改为 HTTP URL 形态——`mcpdog config mcp-config`（含 `--json`）与 Web 界面「连接 MCPDOG」弹窗均改以 URL 接入为主推方案，stdio 降为兼容路径。Web 弹窗默认选中 HTTP 页签，URL 由当前页面 origin 推导（改端口自动跟随）；CLI 生成的是固定默认端口 `http://127.0.0.1:38881/mcp`，并在输出中注明该端口仅为默认值（38881 被占用时 daemon 会自动顺延，需按实际端口替换），以及 daemon 带 `MCPDOG_AUTH_TOKEN` 启动时需自行补 `headers.Authorization`。
+- **修复**：删除会在同一进程内重复拉起全部子服务器的旧 HTTP 实现（`mcpdog start` 路径上可复现），HTTP 传输统一由 daemon 的 `/mcp` 端点提供。
+
 ## [1.0.9] - 2026-09-14
 
 - **修复（关键）**：下游 stdio server 进程异常退出后重连失效。`sendRequest` 判定进程已死并调用 `connect()`，但 `connect()` 顶部的 `isConnected` 守卫在标志位陈旧时直接 `return`（且只 `console.error`、不写日志管理器，界面上看不到），调用方随即无条件记录「Reconnection successful」——**日志说重连成功，请求却被写进已断开的管道，最终要等 30 秒超时才失败**。根因是 `isConnected` 与进程 `'exit'` 事件之间存在时序窗口（`exitCode` 在 libuv 回调里同步置位，`'exit'` 事件要等 nextTick 才发出）。现改为以进程实况（`process`/`stdin`/`killed`/`exitCode`）作为唯一权威判据，标志位陈旧时复位并清理后走重连，重连后再复核一次进程可用性，不再假报成功。

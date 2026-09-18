@@ -412,27 +412,29 @@ export class ConfigCommands {
     const { resolve } = await import('path');
     const absoluteConfigPath = resolve(configPath);
 
+    const httpPort = 38881; // daemon start 的默认 dashboard 端口，也是 /mcp 的端口
+
     if (CLIUtils.isJsonMode()) {
-      const configs = {
-        absolutePath: {
+      CLIUtils.jsonOutput({
+        // 本命令离线生成配置，不探测运行中的 daemon：端口与鉴权都需用户按实际启动参数核对
+        note: `url 中的 ${httpPort} 是 daemon 的默认 dashboard 端口，实际端口以 daemon 启动时用的为准（38881 被占用时 daemon start 会自动顺延）。若 daemon 启动时设置了 MCPDOG_AUTH_TOKEN，/mcp 需要鉴权，请自行在 recommended 配置中补上 headers.Authorization = "Bearer <token>"。`,
+        recommended: {
           mcpServers: {
             mcpdog: {
-              command: "mcpdog",
-              args: ["serve", "--config", absoluteConfigPath]
+              type: 'streamable-http',
+              url: `http://127.0.0.1:${httpPort}/mcp`
             }
           }
         },
-        workingDirectory: {
+        compatible: {
           mcpServers: {
             mcpdog: {
-              command: "mcpdog", 
-              args: ["serve"],
-              cwd: cwd
+              command: 'mcpdog',
+              args: ['proxy', '--config', absoluteConfigPath]
             }
           }
         }
-      };
-      CLIUtils.jsonOutput(configs);
+      });
       return;
     }
 
@@ -441,7 +443,7 @@ export class ConfigCommands {
     console.log(`${CLIUtils.colorize('📋 环境信息:', 'yellow')}`);
     console.log(`  MCPDog目录: ${cwd}`);
     console.log(`  配置文件: ${absoluteConfigPath}`);
-    console.log(`  服务器总数: ${servers.length}`);
+    console.log(`  服务器总数: ${Object.keys(servers).length}`);
     console.log(`  启用服务器: ${enabledServers.length}`);
     
     if (enabledServers.length === 0) {
@@ -452,47 +454,38 @@ export class ConfigCommands {
 
     console.log(`\n${CLIUtils.colorize('🔧 推荐的MCP客户端配置:', 'cyan')}\n`);
     
-    // 方案1: 绝对路径 (推荐)
-    console.log(`${CLIUtils.colorize('📱 方案1: 使用绝对路径 (推荐)', 'green')}`);
+    // 推荐方案: HTTP URL 接入常驻 daemon
+    console.log(`${CLIUtils.colorize('📱 推荐（HTTP）: 客户端以 URL 连接常驻 daemon', 'green')}`);
     console.log('```json');
     console.log(JSON.stringify({
       mcpServers: {
         mcpdog: {
-          command: "mcpdog",
-          args: ["serve", "--config", absoluteConfigPath]
+          type: "streamable-http",
+          url: `http://127.0.0.1:${httpPort}/mcp`
         }
       }
     }, null, 2));
     console.log('```\n');
     
-    // 方案2: 工作目录
-    console.log(`${CLIUtils.colorize('📁 方案2: 使用工作目录', 'blue')}`);
+    // 兼容方案: stdio 代理
+    console.log(`${CLIUtils.colorize('📁 兼容（STDIO）: 传统 stdio 接入，每次会话拉起子进程', 'blue')}`);
     console.log('```json');
     console.log(JSON.stringify({
       mcpServers: {
         mcpdog: {
           command: "mcpdog",
-          args: ["serve"],
-          cwd: cwd
+          args: ["proxy", "--config", absoluteConfigPath]
         }
       }
     }, null, 2));
     console.log('```\n');
     
-    // 方案3: Node.js后备
-    console.log(`${CLIUtils.colorize('🔧 方案3: Node.js后备 (如果mcpdog命令不可用)', 'yellow')}`);
-    const nodePath = resolve(cwd, 'dist/cli/cli-main.js');
-    console.log('```json');
-    console.log(JSON.stringify({
-      mcpServers: {
-        mcpdog: {
-          command: "node",
-          args: [nodePath, "serve"],
-          cwd: cwd
-        }
-      }
-    }, null, 2));
-    console.log('```\n');
+    console.log(`${CLIUtils.colorize('ℹ️  说明:', 'yellow')}`);
+    console.log(`  • HTTP 方式需先运行 mcpdog daemon start（默认 dashboard 端口 ${httpPort}，/mcp 与它同端口）`);
+    console.log(`  • 上面的端口是默认值，实际端口以 daemon 启动时用的为准（38881 被占用时 daemon start 会自动顺延），不同请自行替换 URL`);
+    console.log('  • 若 daemon 启动时设置了 MCPDOG_AUTH_TOKEN，/mcp 需要鉴权，请自行在配置中补上 headers.Authorization = "Bearer <token>"');
+    console.log('  • stdio 方式仍可用，但每次会话会拉起一个代理子进程');
+    console.log('');
     
     console.log(`${CLIUtils.colorize('💡 使用说明:', 'cyan')}`);
     console.log('  • 复制上述配置到你的MCP客户端配置文件');

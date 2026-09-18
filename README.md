@@ -50,7 +50,25 @@ npx @keysqiu/mcpdog@latest daemon start --web-port 38881
 
 ### 客户端接入（以 Claude Code 为例）
 
-在 MCP 客户端配置中加入：
+daemon 在 dashboard 端口上同时暴露标准 StreamableHTTP MCP 端点 `/mcp`，客户端直接用 URL 接入：
+
+```json
+{
+  "mcpServers": {
+    "mcpdog": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:38881/mcp"
+    }
+  }
+}
+```
+
+> 需先启动 daemon（`npx @keysqiu/mcpdog@latest daemon start --web-port 38881`）或安装桌面版；端口以实际启动的 dashboard 端口为准（`/mcp` 与它同端口）。
+> 客户端连的是 MCPDog 聚合入口，前提是 daemon 已启动并配好子服务器。
+
+#### stdio 兼容接入
+
+传统 stdio 接入方式仍可用，属于兼容路径：
 
 ```json
 {
@@ -63,7 +81,7 @@ npx @keysqiu/mcpdog@latest daemon start --web-port 38881
 }
 ```
 
-> 客户端连的是 MCPDog 聚合入口，前提是 daemon 已启动并配好子服务器。
+> stdio 方式会为每次客户端会话拉起一个代理子进程，仍受会话生命周期影响；推荐优先使用上面的 HTTP 方式。
 
 ## 📖 常用命令
 

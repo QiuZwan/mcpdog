@@ -4,12 +4,13 @@ import { useConfigStore } from '../store/configStore';
 
 export const ClientConfigModal: React.FC = () => {
   const [copied, setCopied] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'stdio' | 'http'>('stdio');
+  const [activeTab, setActiveTab] = useState<'http' | 'stdio'>('http');
 
   const { hideClientConfig, authRequired, authToken } = useConfigStore();
-
-  // Use auth state from store - only include headers if auth is required AND we have a token
   const shouldIncludeAuth = authRequired && authToken;
+
+  // 管理页正是从 daemon 的 dashboard 端口打开的，因此用当前 origin 即为正确的 MCP 基址
+  const mcpUrl = `${window.location.origin}/mcp`;
 
   const handleCopyConfig = async (config: string, type: string) => {
     try {
@@ -21,22 +22,11 @@ export const ClientConfigModal: React.FC = () => {
     }
   };
 
-  // STDIO configuration
-  const stdioConfig = {
-    "mcpServers": {
-      "mcpdog": {
-        "command": "npx",
-        "args": ["@keysqiu/mcpdog@latest"]
-      }
-    }
-  };
-
-  // HTTP Streamable configuration
   const httpConfig = {
     "mcpServers": {
-      "mcpdog-http": {
+      "mcpdog": {
         "type": "streamable-http",
-        "url": "http://localhost:4000",
+        "url": mcpUrl,
         ...(shouldIncludeAuth && {
           "headers": {
             "Authorization": `Bearer ${authToken}`
@@ -46,16 +36,25 @@ export const ClientConfigModal: React.FC = () => {
     }
   };
 
+  const stdioConfig = {
+    "mcpServers": {
+      "mcpdog": {
+        "command": "npx",
+        "args": ["@keysqiu/mcpdog@latest"]
+      }
+    }
+  };
+
   const configs = {
-    stdio: {
-      title: 'STDIO 连接',
-      description: '标准输入输出连接，适用于 Claude Desktop 等 MCP 客户端',
-      config: JSON.stringify(stdioConfig, null, 2)
-    },
     http: {
-      title: 'HTTP Streamable 连接',
-      description: '基于 HTTP 的流式传输连接',
+      title: 'HTTP Streamable 连接（推荐）',
+      description: '客户端以 URL 连接常驻服务，无需为每次会话启动子进程',
       config: JSON.stringify(httpConfig, null, 2)
+    },
+    stdio: {
+      title: 'STDIO 连接（兼容路径）',
+      description: '传统 stdio 接入；需为每次会话启动代理子进程，仍受会话生命周期影响',
+      config: JSON.stringify(stdioConfig, null, 2)
     }
   };
 
@@ -84,16 +83,16 @@ export const ClientConfigModal: React.FC = () => {
           {/* Tabs */}
           <div className="tabs tabs-boxed justify-center mb-6">
             <button
-              className={`tab ${activeTab === 'stdio' ? 'tab-active' : ''}`}
-              onClick={() => setActiveTab('stdio')}
-            >
-              STDIO 连接
-            </button>
-            <button
               className={`tab ${activeTab === 'http' ? 'tab-active' : ''}`}
               onClick={() => setActiveTab('http')}
             >
               HTTP Streamable
+            </button>
+            <button
+              className={`tab ${activeTab === 'stdio' ? 'tab-active' : ''}`}
+              onClick={() => setActiveTab('stdio')}
+            >
+              STDIO 连接
             </button>
           </div>
 
