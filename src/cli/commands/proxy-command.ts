@@ -36,12 +36,15 @@ export class ProxyCommand {
     const transport = options.transport || 'stdio';
 
     if (transport === 'streamable-http') {
+      // 用 exitCode + return 而不是 process.exit(1)：stderr 是管道时进程立即退出可能截断
+      // 尚未 flush 的写入，而这段是旧用户唯一的迁移指引（Windows 是目标平台）
       process.stderr.write(
         'MCPDog: --transport streamable-http 已移除。\n' +
         '请用 `mcpdog daemon start` 启动常驻服务，然后以 URL 接入：\n' +
         '  http://127.0.0.1:38881/mcp\n'
       );
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     } else if (options['web-port']) {
       await this.startWebMode(options);
     } else {

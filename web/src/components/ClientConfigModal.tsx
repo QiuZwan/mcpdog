@@ -9,8 +9,13 @@ export const ClientConfigModal: React.FC = () => {
   const { hideClientConfig, authRequired, authToken } = useConfigStore();
   const shouldIncludeAuth = authRequired && authToken;
 
-  // 管理页正是从 daemon 的 dashboard 端口打开的，因此用当前 origin 即为正确的 MCP 基址
-  const mcpUrl = `${window.location.origin}/mcp`;
+  // 管理页正是从 daemon 的 dashboard 端口打开的，因此用当前 origin 即为正确的 MCP 基址。
+  // 但 daemon 只监听 127.0.0.1：Node 18/19 下 localhost 会优先解析到 ::1，客户端拿到
+  // http://localhost:<port>/mcp 会直接 fetch failed。故 localhost 一律改写为 127.0.0.1，
+  // 端口保持实际值；CLI 生成器输出的也是 127.0.0.1，两处由此一致。
+  const { protocol, hostname, port } = window.location;
+  const mcpHost = hostname === 'localhost' ? '127.0.0.1' : hostname;
+  const mcpUrl = `${protocol}//${mcpHost}${port ? `:${port}` : ''}/mcp`;
 
   const handleCopyConfig = async (config: string, type: string) => {
     try {

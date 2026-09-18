@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { request as httpRequest } from 'http';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { io as ioClient } from 'socket.io-client';
 
 import { MCPDogDaemon } from './mcpdog-daemon.js';
 
@@ -186,6 +187,61 @@ describe('/mcp 端点（集成）', () => {
     const res = await fetch(`${base}/api/status`);
     expect(res.headers.get('access-control-allow-origin')).toBe('*');
   });
+
+  // Engine.IO 在 Express 之前接管 /socket.io/*，guardLocalOnly 看不到这些请求；
+  // WebSocket 握手也不受 CORS 约束。这里直接验证 Socket.IO 自己的回环 Origin 白名单。
+  async function rawGetSocketIo(origin: string): Promise<{ status: number; body: string }> {
+    return new Promise((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: PORT,
+          path: '/socket.io/?EIO=4&transport=polling',
+          method: 'GET',
+          headers: { origin },
+        },
+        (res) => {
+          let data = '';
+          res.setEncoding('utf8');
+          res.on('data', (chunk) => (data += chunk));
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, body: data }));
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+  }
+
+  function wsConnect(origin: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const socket = ioClient(base, {
+        transports: ['websocket'], // dashboard 客户端用的就是 websocket 传输
+        reconnection: false,
+        timeout: 4000,
+        extraHeaders: { Origin: origin },
+      });
+      const done = (ok: boolean) => {
+        socket.close();
+        resolve(ok);
+      };
+      socket.on('connect', () => done(true));
+      socket.on('connect_error', () => done(false));
+      setTimeout(() => done(false), 6000);
+    });
+  }
+
+  it('Socket.IO 只接受回环 Origin：回环放行、外来 Origin 被拒', async () => {
+    const loopback = await rawGetSocketIo('http://127.0.0.1:45231');
+    expect(loopback.status).toBe(200);
+    const localhost = await rawGetSocketIo('http://localhost:45231');
+    expect(localhost.status).toBe(200);
+    const foreign = await rawGetSocketIo('http://evil.example.com');
+    expect(foreign.status).toBe(403);
+
+    // WebSocket 握手必须同样被 allowRequest 拦住，否则「恶意本机网页」仍能开 socket
+    expect(await wsConnect('http://127.0.0.1:45231')).toBe(true);
+    expect(await wsConnect('http://evil.example.com')).toBe(false);
+  }, 30000);
 });
 
 describe('/mcp Bearer 鉴权（集成）', () => {

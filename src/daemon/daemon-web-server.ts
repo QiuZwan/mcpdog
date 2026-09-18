@@ -22,6 +22,31 @@ import { McpHttpEndpoint } from './mcp-http-endpoint.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Socket.IO 的 /socket.io/* 由 Engine.IO 在 Express 之前接管（Engine.IO 会摘掉并重排 http
+// server 的 request 监听器），因此 guardLocalOnly 中间件看不到这些请求；而 WebSocket 握手
+// 本就不受 CORS 约束。要真正挡住恶意本机网页，必须在这里自己校验 Origin：
+//  - cors.origin 收窄到回环 origin，作用在轮询请求的 CORS 响应头
+//  - allowRequest 对轮询与 WebSocket 握手统一校验，非回环 Origin 直接 403
+// dashboard 与 dev server 的 origin 都是回环，放行不影响自身连接；非浏览器客户端不带
+// Origin（curl 等），按 CORS 惯例放行。
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+const LOOPBACK_ORIGIN_PATTERNS = [
+  /^https?:\/\/127\.0\.0\.1(:\d+)?$/,
+  /^https?:\/\/localhost(:\d+)?$/,
+  /^https?:\/\/\[::1\](:\d+)?$/,
+];
+
+function isLoopbackOrigin(origin: string | undefined): boolean {
+  if (!origin) {
+    return true;
+  }
+  try {
+    return LOOPBACK_HOSTNAMES.has(new URL(origin).hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
 export class DaemonWebServer {
   private app: express.Application;
   private server: any;
@@ -41,8 +66,11 @@ export class DaemonWebServer {
     this.server = createServer(this.app);
     this.io = new SocketIOServer(this.server, {
       cors: {
-        origin: "*",
+        origin: LOOPBACK_ORIGIN_PATTERNS,
         methods: ["GET", "POST"]
+      },
+      allowRequest: (req, callback) => {
+        callback(null, isLoopbackOrigin(req.headers.origin));
       }
     });
 
@@ -50,10 +78,6 @@ export class DaemonWebServer {
     this.setupRoutes();
     this.setupWebSocket();
     this.setupDaemonEvents();
-  }
-
-  getMcpEndpoint(): McpHttpEndpoint | undefined {
-    return this.mcpEndpoint;
   }
 
   private setupMiddleware() {

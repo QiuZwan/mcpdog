@@ -5,10 +5,11 @@
 ## [1.1.0] - 2026-09-18
 
 - **新增**：daemon 内建 StreamableHTTP `/mcp` 端点，与 dashboard 同端口（默认 38881）。客户端改用 URL 接入常驻服务，无需为每次会话拉起子进程；配置热更新后会向已连接的会话推送 `notifications/tools/list_changed`，支持该通知的客户端无需重启即可刷新工具清单。
-- **变更（破坏性，需用户注意）**：dashboard 与 `/mcp` 仅监听 `127.0.0.1`，不再允许局域网访问（此前 dashboard 可被同网段其他机器打开）。如需远程访问请自建反向代理。
+- **变更（破坏性，需用户注意）**：dashboard 与 `/mcp` 仅监听 `127.0.0.1`，不再允许局域网访问（此前 dashboard 可被同网段其他机器打开）。如需远程访问请自建反向代理，**且代理必须把 `Host` 改写成 `127.0.0.1`**：Host/Origin 校验只接受回环取值，转发原始 `Host` 会被直接回 403 且响应里没有诊断信息（表现为反代后一律 403）。
 - **变更（破坏性，需用户注意）**：`mcpdog proxy --transport streamable-http` 与 `mcpdog --transport streamable-http` 已移除，执行时打印改用 `daemon start` 的指引并以非零码退出。
 - **变更（破坏性，需用户注意）**：`mcpdog start --mcp-http-port` 弃用（告警并忽略，`/mcp` 固定与 dashboard 同端口），`mcpdog start --http-only` 移除（`/mcp` 与 dashboard 同端口，无法只开 HTTP 传输）。
-- **变更**：接入配置生成改为 HTTP URL 形态——`mcpdog config mcp-config`（含 `--json`）与 Web 界面「连接 MCPDOG」弹窗均改以 URL 接入为主推方案，stdio 降为兼容路径。Web 弹窗默认选中 HTTP 页签，URL 由当前页面 origin 推导（改端口自动跟随）；CLI 生成的是固定默认端口 `http://127.0.0.1:38881/mcp`，并在输出中注明该端口仅为默认值（38881 被占用时 daemon 会自动顺延，需按实际端口替换），以及 daemon 带 `MCPDOG_AUTH_TOKEN` 启动时需自行补 `headers.Authorization`。
+- **变更（破坏性，需用户注意）**：`mcpdog config mcp-config --json` 的输出结构改变。旧结构为 `{absolutePath, workingDirectory}`，新结构为 `{note, recommended, compatible}`（`recommended` 为 HTTP URL 接入，`compatible` 为 stdio 代理接入）。**外部脚本若解析这两个旧键会直接拿不到值**，需按新键调整。
+- **变更**：接入配置生成改为 HTTP URL 形态——`mcpdog config mcp-config`（含 `--json`）与 Web 界面「连接 MCPDOG」弹窗均改以 URL 接入为主推方案，stdio 降为兼容路径。Web 弹窗默认选中 HTTP 页签，URL 由当前页面 origin 推导（改端口自动跟随，`localhost` 会改写为 `127.0.0.1` 以匹配仅回环监听的 daemon）；CLI 生成的是固定默认端口 `http://127.0.0.1:38881/mcp`，并在输出中注明该端口仅为默认值（38881 被占用时 daemon 会自动顺延，需按实际端口替换），以及 daemon 带 `MCPDOG_AUTH_TOKEN` 启动时需自行补 `headers.Authorization`。
 - **修复**：删除会在同一进程内重复拉起全部子服务器的旧 HTTP 实现（`mcpdog start` 路径上可复现），HTTP 传输统一由 daemon 的 `/mcp` 端点提供。
 
 ## [1.0.9] - 2026-09-14

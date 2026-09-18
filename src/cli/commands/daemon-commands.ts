@@ -21,6 +21,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 不设上限就永远到不了强杀兜底
 const SHUTDOWN_CONNECT_TIMEOUT_MS = 3000;
 
+// 优雅停机的等待上限与轮询间隔。
+// 上限必须收紧：比本版本旧的 daemon 不认识 shutdown 消息（落到 handleClientMessage 的
+// default 分支只打一条告警），升级路径上必然是跨版本，等待窗口越长、静默停顿越久。
+// 5s 足以覆盖 stop() 关 web server + 停子服务器的耗时。
+const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 5000;
+const GRACEFUL_SHUTDOWN_POLL_INTERVAL_MS = 250;
+
 export class DaemonCommands {
   private configManager: ConfigManager;
   private mcpdogDir: string;
@@ -262,27 +269,94 @@ export class DaemonCommands {
     const shutdownRequested = await this.requestShutdown(ipcPort);
 
     if (shutdownRequested) {
-      let attempts = 0;
-      while (attempts < 30) {
-        try {
-          process.kill(pid, 0); // Check if process still exists
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          attempts++;
-        } catch (error) {
-          // Process has stopped
-          break;
+      let waitedMs = 0;
+      while (waitedMs < GRACEFUL_SHUTDOWN_TIMEOUT_MS) {
+        if (!this.isProcessAlive(pid)) {
+          return true;
+        }
+        await new Promise(resolve => setTimeout(resolve, GRACEFUL_SHUTDOWN_POLL_INTERVAL_MS));
+        waitedMs += GRACEFUL_SHUTDOWN_POLL_INTERVAL_MS;
+        // 进度可见：老版本 daemon 会忽略 shutdown 消息，不打印就是一段没有解释的静默停顿
+        if (waitedMs % 1000 === 0) {
+          CLIUtils.info(`Waiting for daemon (PID ${pid}) to stop gracefully... ${waitedMs / 1000}s / ${GRACEFUL_SHUTDOWN_TIMEOUT_MS / 1000}s`);
         }
       }
 
-      if (attempts < 30) {
+      // 最后一次轮询的 sleep 期间进程可能刚好退出：必须先复核存活再升级强杀。
+      // 否则会对一个已死 PID 再执行一次强杀，并把一次成功的优雅停机误报为失败
+      // （stop() 还会因此去删 daemon 已经删掉的 PID 文件）。
+      if (!this.isProcessAlive(pid)) {
         return true;
+      }
+
+      CLIUtils.warn(
+        `Daemon (PID ${pid}) did not stop gracefully within ${GRACEFUL_SHUTDOWN_TIMEOUT_MS / 1000}s. ` +
+        'The running daemon may predate this version and not support graceful shutdown ' +
+        '(older builds ignore the shutdown message). Forcing termination...'
+      );
+    } else {
+      // shutdown 请求没送出去（daemon 在不同 IPC 端口或已死）时不等 5s，直接强杀兜底
+      CLIUtils.warn('Daemon did not accept the shutdown request, forcing termination...');
+    }
+
+    const killed = await this.forceKill(pid);
+    if (!killed) {
+      // 不能吞掉：daemon 可能仍在运行，调用方若继续报 "Daemon stopped" 就是假成功
+      throw new Error(`Daemon (PID ${pid}) is still running after a failed force kill`);
+    }
+    return false;
+  }
+
+  // 强杀兜底：Windows 上 process.kill 的 SIGKILL 同样是 TerminateProcess，用 taskkill /F 更明确。
+  // /T 必须带：Windows 没有 job object，父进程被杀不会带走子进程，缺 /T 会把子服务器 node 进程
+  // 全部留成孤儿 —— 而这条兜底路径正是优雅停机失败时走的、最可能产生孤儿的那条。
+  // 返回 false 表示进程可能仍存活，调用方不得报成功。
+  private async forceKill(pid: number): Promise<boolean> {
+    if (!this.isProcessAlive(pid)) {
+      return true;
+    }
+
+    if (process.platform !== 'win32') {
+      try {
+        process.kill(pid, 'SIGKILL');
+        return true;
+      } catch (error) {
+        CLIUtils.warn(`Failed to kill daemon (PID ${pid}): ${(error as Error).message}`);
+        return false;
       }
     }
 
-    // shutdown 请求没送出去（daemon 在不同 IPC 端口或已死）时不等 30s，直接强杀兜底
-    CLIUtils.warn('Daemon did not stop gracefully, forcing termination...');
-    await this.forceKill(pid);
-    return false;
+    return new Promise<boolean>((resolve) => {
+      const killer = spawn('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+      killer.on('close', (code) => {
+        if (code === 0) {
+          resolve(true);
+          return;
+        }
+        // 进程恰好在 taskkill 执行期间退出时 taskkill 也会回非 0（找不到进程），
+        // 以存活实况为准，不能仅凭退出码判定失败
+        if (!this.isProcessAlive(pid)) {
+          resolve(true);
+          return;
+        }
+        CLIUtils.warn(`taskkill exited with code ${code}, daemon (PID ${pid}) may still be running`);
+        resolve(false);
+      });
+      killer.on('error', (error) => {
+        CLIUtils.warn(`taskkill failed: ${error.message}`);
+        resolve(false);
+      });
+    });
+  }
+
+  // 进程存活探测：signal 0 不发送信号，仅做存在性检查
+  private isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // 请求 daemon 走优雅停机（stop() + process.exit）。
@@ -309,25 +383,6 @@ export class DaemonCommands {
     } finally {
       client.disconnect();
     }
-  }
-
-  // 强杀兜底：Windows 上 process.kill 的 SIGKILL 同样是 TerminateProcess，用 taskkill /F 更明确。
-  // /T 必须带：Windows 没有 job object，父进程被杀不会带走子进程，缺 /T 会把子服务器 node 进程
-  // 全部留成孤儿 —— 而这条兜底路径正是优雅停机失败时走的、最可能产生孤儿的那条。
-  private async forceKill(pid: number): Promise<void> {
-    if (process.platform !== 'win32') {
-      process.kill(pid, 'SIGKILL');
-      return;
-    }
-
-    await new Promise<void>((resolve) => {
-      const killer = spawn('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
-      killer.on('close', () => resolve());
-      killer.on('error', (error) => {
-        CLIUtils.warn(`taskkill failed: ${error.message}`);
-        resolve();
-      });
-    });
   }
 
   async status(args: string[], options: any): Promise<void> {
