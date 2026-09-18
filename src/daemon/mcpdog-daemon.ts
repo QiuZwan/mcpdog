@@ -455,6 +455,10 @@ export class MCPDogDaemon extends EventEmitter {
     return this.configManager;
   }
 
+  getMCPServer(): MCPDogServer {
+    return this.mcpServer;
+  }
+
   // Web server support (optional)
   async startWebServer(port: number): Promise<void> {
     const { DaemonWebServer } = await import('./daemon-web-server.js');

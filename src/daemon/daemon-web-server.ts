@@ -17,6 +17,7 @@ import { globalLogManager } from '../logging/server-log-manager.js';
 import { ServerNameValidator } from '../utils/server-name-validator.js';
 import { parseClaudeJson, buildImportPlan, ClaudeMCPEntry } from '../utils/claude-mcp-importer.js';
 import { createExpressAuthMiddleware } from '../middleware/auth.js';
+import { McpHttpEndpoint } from './mcp-http-endpoint.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -28,6 +29,7 @@ export class DaemonWebServer {
   private daemon: MCPDogDaemon;
   private port: number;
   private configManager: ConfigManager; // Add configManager property
+  private mcpEndpoint?: McpHttpEndpoint;
 
   constructor(daemon: MCPDogDaemon, port: number) {
     this.daemon = daemon;
@@ -50,44 +52,75 @@ export class DaemonWebServer {
     this.setupDaemonEvents();
   }
 
+  getMcpEndpoint(): McpHttpEndpoint | undefined {
+    return this.mcpEndpoint;
+  }
+
   private setupMiddleware() {
-    // CORS support
-    this.app.use(cors());
-    
+    // CORS 挂在 /api 路由上（见 createAPIRouter），不在此处全局施加。
+    // 曾经的写法是「除字面量 /mcp 外全挂 cors()」，但 Express 路由匹配非严格且大小写不敏感，
+    // /mcp/ 与 /MCP 仍会带着 Access-Control-Allow-Origin: * 命中 /mcp 处理器 —— 收窄形同虚设。
+
+    // Host / Origin 校验：阻断浏览器经 DNS rebinding 访问本机服务
+    this.app.use(this.guardLocalOnly());
+
+    const authToken = process.env.MCPDOG_AUTH_TOKEN;
+
+    // /mcp 必须注册在 express.json() 之前：SDK 需要读原始请求流，且不受 body-parser
+    // 默认 100kb 体积上限的约束（工具参数可能很大）。同时也必须在 setupRoutes() 的
+    // SPA 兜底之前，否则 GET /mcp 的 SSE 流会被返回 index.html。
+    this.setupMcpEndpoint();
+    const mcpHandler: express.RequestHandler = (req, res) => {
+      // handleRequest 内部的 try 只覆盖 transport 处理段；会话查找等路径若抛出，
+      // 未被 catch 的 rejection 会让 Express 无法回应请求，故在此兜底一次
+      this.mcpEndpoint!.handleRequest(req, res).catch((error) => {
+        console.error('[DAEMON-WEB] /mcp 请求处理失败:', error);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Internal error' });
+        }
+      });
+    };
+    if (authToken) {
+      // 不复用 createExpressAuthMiddleware：它是面向浏览器的管理台中间件 —— 非 /api 的
+      // 未授权请求会被重定向到登录页（302）而不是 401，且会放过非 /api 的 GET，而 /mcp
+      // 的 SSE 流恰恰是 GET。机器客户端需要确定性的 401。
+      this.app.all('/mcp', this.requireMcpToken(authToken), mcpHandler);
+    } else {
+      this.app.all('/mcp', mcpHandler);
+    }
+
     // JSON parsing
     this.app.use(express.json());
-    
-    // Authentication middleware (if token is configured)
-    const authToken = process.env.MCPDOG_AUTH_TOKEN;
+
+    // 这两个端点必须排在全局鉴权中间件之前（否则登录本身就要先登录），
+    // 但排在 express.json() 之后 —— 登录要读 body，逐路由再挂一次解析器是多余的
     if (authToken) {
       console.log('[DAEMON-WEB] Authentication enabled');
-      
-      // Add authentication check endpoint (before auth middleware)
+
       this.app.get('/api/auth/status', (req, res) => {
         const authHeader = req.headers.authorization;
         if (!authHeader) {
           return res.json({ authenticated: false, required: true });
         }
-        
+
         const parts = authHeader.split(' ');
         if (parts.length !== 2 || parts[0] !== 'Bearer') {
           return res.json({ authenticated: false, required: true });
         }
-        
+
         const token = parts[1];
         const isAuthorized = Buffer.compare(Buffer.from(token), Buffer.from(authToken)) === 0;
-        
+
         if (!isAuthorized) {
           return res.json({ authenticated: false, required: true });
         }
-        
+
         res.json({ authenticated: true, required: true });
       });
-      
-      // Add login endpoint (before auth middleware)
+
       this.app.post('/api/auth/login', (req, res) => {
         const { token } = req.body;
-        
+
         if (!token) {
           return res.status(400).json({ error: '需要提供访问令牌' });
         }
@@ -100,7 +133,7 @@ export class DaemonWebServer {
 
         res.json({ success: true, message: '登录成功' });
       });
-      
+
       this.app.use(createExpressAuthMiddleware(authToken));
     } else {
       // When auth is disabled, return auth not required
@@ -108,18 +141,119 @@ export class DaemonWebServer {
         res.json({ authenticated: true, required: false });
       });
     }
-    
+
     // Static file serving
     const staticPath = path.join(__dirname, '../../web/dist');
     this.app.use(express.static(staticPath));
-    
+
     // API route prefix
     this.app.use('/api', this.createAPIRouter());
   }
 
+  /** 用 daemon 内唯一的聚合核心构造 MCP 端点；路由已在 setupMiddleware 中注册 */
+  private setupMcpEndpoint(): void {
+    const mcpServer = this.daemon.getMCPServer();
+    this.mcpEndpoint = new McpHttpEndpoint({
+      serverName: 'mcpdog',
+      serverVersion: this.readPackageVersion(),
+      listTools: () => mcpServer.listToolsResult(),
+      callTool: (name, args) => mcpServer.callToolResult(name, args),
+    });
+
+    // 配置热更新 / 服务器与工具开关 → 通知已连接客户端刷新工具清单
+    const toolRouter = mcpServer.getToolRouter();
+    toolRouter.on('routes-updated', () => {
+      void this.mcpEndpoint?.notifyToolsChanged();
+    });
+  }
+
+  private readPackageVersion(): string {
+    try {
+      const pkgPath = path.join(__dirname, '../../package.json');
+      return JSON.parse(readFileSync(pkgPath, 'utf-8')).version || 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  /**
+   * /mcp 的 Bearer 校验。与管理台的中间件分开，是因为面向浏览器的中间件在未授权时
+   * 会 302 到登录页，机器客户端拿不到可解释的失败；这里统一回 401 JSON。
+   */
+  private requireMcpToken(authToken: string): express.RequestHandler {
+    return (req, res, next) => {
+      const authHeader = String(req.headers.authorization || '');
+      const parts = authHeader.split(' ');
+
+      if (parts.length !== 2 || parts[0] !== 'Bearer') {
+        res.status(401).json({ error: 'Authorization header is missing or malformed. Expected: Bearer <token>' });
+        return;
+      }
+
+      if (Buffer.compare(Buffer.from(parts[1]), Buffer.from(authToken)) !== 0) {
+        res.status(401).json({ error: 'Invalid authentication token' });
+        return;
+      }
+
+      next();
+    };
+  }
+
+  /**
+   * 只接受本机回环的 Host / Origin。
+   * 打开本机网页时浏览器会把 Host 设为实际访问的域名，DNS rebinding 攻击下 Host 是攻击者域名
+   * 而非回环名，因此该校验能阻断「恶意网页读写本机配置与工具」这一类访问。
+   *
+   * 说明：SDK 的 StreamableHTTPServerTransport 自带 allowedHosts + enableDnsRebindingProtection，
+   * 但它只覆盖 /mcp。本需求同时要保护 dashboard 的 /api（可改配置、可调用工具，暴露面不比 /mcp 小），
+   * 两套校验器会增加「哪条路径由谁守」的理解成本，因此统一用这一个中间件覆盖两者。
+   */
+  private guardLocalOnly(): express.RequestHandler {
+    const allowedHosts = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+
+    const normalize = (value: string): string => {
+      const lower = value.toLowerCase().trim();
+      if (lower.startsWith('[')) {
+        const end = lower.indexOf(']');
+        return end > 0 ? lower.slice(0, end + 1) : lower;
+      }
+      const colon = lower.lastIndexOf(':');
+      return colon > 0 ? lower.slice(0, colon) : lower;
+    };
+
+    return (req, res, next) => {
+      const host = normalize(String(req.headers.host || ''));
+      if (!allowedHosts.has(host)) {
+        res.status(403).json({ error: 'Forbidden: unexpected Host header' });
+        return;
+      }
+
+      const origin = req.headers.origin;
+      if (origin) {
+        let originHost = '';
+        try {
+          originHost = new URL(String(origin)).hostname.toLowerCase();
+        } catch {
+          res.status(403).json({ error: 'Forbidden: malformed Origin header' });
+          return;
+        }
+        if (!allowedHosts.has(originHost)) {
+          res.status(403).json({ error: 'Forbidden: unexpected Origin header' });
+          return;
+        }
+      }
+
+      next();
+    };
+  }
+
   private createAPIRouter() {
     const router = express.Router();
-    
+
+    // CORS 只作用于 dashboard API；/mcp 与静态资源都不回 CORS 头。
+    // 只创建一次中间件实例，避免逐请求分配。
+    router.use(cors());
+
     // System status API
     router.get('/status', this.handleGetStatus.bind(this));
 
@@ -1268,7 +1402,7 @@ export class DaemonWebServer {
   // Server control
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.server.listen(this.port, () => {
+      this.server.listen(this.port, '127.0.0.1', () => {
         console.log(`[DAEMON-WEB] Web interface started on port ${this.port}`);
         console.log(`[DAEMON-WEB] Dashboard: http://localhost:${this.port}`);
         console.log(`[DAEMON-WEB] WebSocket: ws://localhost:${this.port}`);
