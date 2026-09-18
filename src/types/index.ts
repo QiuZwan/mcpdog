@@ -75,6 +75,11 @@ export interface MCPTool {
   };
 }
 
+/** tools/call 的去信封结果，供 HTTP 端点直接消费（不带 jsonrpc/id） */
+export type ToolCallOutcome =
+  | { ok: true; result: any }
+  | { ok: false; error: { code: number; message: string; data?: any } };
+
 export interface MCPRequest {
   jsonrpc: '2.0';
   id: string | number;

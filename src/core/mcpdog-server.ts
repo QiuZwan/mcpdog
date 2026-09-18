@@ -6,6 +6,8 @@ import {
   MCPRequest, 
   MCPResponse, 
   MCPNotification, 
+  MCPTool,
+  ToolCallOutcome,
   ClientCapabilities, 
   ServerAdapter,
   MCPServerConfig 
@@ -530,6 +532,23 @@ export class MCPDogServer extends EventEmitter {
       };
     }
 
+    const tools = await this.listToolsResult();
+
+    return {
+      jsonrpc: '2.0',
+      id: request.id,
+      result: {
+        tools
+      }
+    };
+  }
+
+  /**
+   * 返回聚合后的工具清单（不含 JSON-RPC 信封）。
+   * 保留原有的智能等待与重试：子服务器连接慢时给足时间，工具数不足阈值时重试，
+   * 避免客户端在 daemon 刚启动时拿到残缺的工具列表。
+   */
+  async listToolsResult(): Promise<MCPTool[]> {
     // Smart waiting mechanism: give slower servers more connection time
     const waitTime = this.calculateOptimalWaitTime();
     if (waitTime > 0) {
@@ -543,11 +562,11 @@ export class MCPDogServer extends EventEmitter {
     let tools = await this.toolRouter.getAllTools(true); // Force refresh
     let attempts = 1;
     const maxAttempts = 3;
-    
+
     // Calculate expected minimum number of tools based on configured servers (at least 5 tools per server)
     const enabledServers = Object.keys(this.configManager.getEnabledServers()).length;
     const expectedMinTools = Math.max(5, enabledServers * 5);
-    
+
     // If tool count is too low, some servers might not be fully connected, try again
     while (attempts < maxAttempts && tools.length < expectedMinTools && enabledServers > 1) {
       console.error(`🔄 Tools count low (${tools.length}), retrying... (attempt ${attempts + 1})`);
@@ -561,13 +580,7 @@ export class MCPDogServer extends EventEmitter {
     console.error(`📊 Current tool distribution:`, toolsByServer);
     console.error(`🔢 Total tools returned: ${tools.length}`);
 
-    return {
-      jsonrpc: '2.0',
-      id: request.id,
-      result: {
-        tools
-      }
-    };
+    return tools;
   }
 
   private calculateOptimalWaitTime(): number {
@@ -608,27 +621,40 @@ export class MCPDogServer extends EventEmitter {
     }
 
     const params = request.params || {};
-    const toolName = params.name;
-    const args = params.arguments || {};
+    const outcome = await this.callToolResult(params.name, params.arguments || {});
 
-    if (!toolName) {
+    if (outcome.ok) {
       return {
         jsonrpc: '2.0',
         id: request.id,
-        error: {
-          code: -32602,
-          message: 'Tool name is required'
-        }
+        result: outcome.result
       };
     }
 
-    const response = await this.toolRouter.callTool(toolName, args);
-    
-    // Use original request ID
     return {
-      ...response,
-      id: request.id
+      jsonrpc: '2.0',
+      id: request.id,
+      error: outcome.error
     };
+  }
+
+  /**
+   * 调用工具并返回去信封结果（不含 jsonrpc/id）。
+   * 工具名缺失与「工具不存在/服务器未连接」两类错误的 code 语义在 ToolRouter 里，
+   * 此处只做形状转换，保证 JSON-RPC 路径与 HTTP 路径共用同一套判定。
+   */
+  async callToolResult(toolName: string, args: Record<string, unknown>): Promise<ToolCallOutcome> {
+    if (!toolName) {
+      return { ok: false, error: { code: -32602, message: 'Tool name is required' } };
+    }
+
+    const response = await this.toolRouter.callTool(toolName, args);
+
+    if (response.error) {
+      return { ok: false, error: response.error };
+    }
+
+    return { ok: true, result: response.result };
   }
 
   private async notifyToolsChanged(): Promise<void> {
