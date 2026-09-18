@@ -1,12 +1,10 @@
 name: Release
 
+# 只由 tag 触发：npm 的版本发布不可撤回，不该有「点一下就跑」的入口。
+# 失败的 run 可在 Actions 页面用 Re-run jobs 重跑，所以不需要 workflow_dispatch。
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   # 桌面壳（Windows 托盘应用）尚未落地 —— 见 docs/superpowers/plans/2026-09-18-mcpdog-windows-shell.md。
@@ -69,6 +67,10 @@ jobs:
     needs: detect-shell
     if: needs.detect-shell.outputs.present == 'true'
     runs-on: windows-latest
+    # 只有这个 job 需要写权限（上传 Release 资产）；发布 npm 的 job 不需要，
+    # 所以不把 contents: write 提到 workflow 级
+    permissions:
+      contents: write
     env:
       PUPPETEER_SKIP_DOWNLOAD: 'true'
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
