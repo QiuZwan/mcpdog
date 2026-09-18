@@ -15,10 +15,8 @@ import os from 'os';
 
 interface StartupConfig {
   enableStdio: boolean;
-  enableHttp: boolean;
   enableDashboard: boolean;
   dashboardPort: number;
-  httpPort: number;
   daemonPort: number;
   pidFile: string;
 }
@@ -71,31 +69,22 @@ ${CLIUtils.colorize('Available actions:', 'yellow')}
     // 支持向后兼容性
     const dashboardPort = parseInt(options['dashboard-port']) ||
                          parseInt(options['web-port']) || 38881;
-    const httpPort = parseInt(options['mcp-http-port']) || 4000;
     const daemonPort = parseInt(options['daemon-port']) || 9999;
     const pidFile = options['pid-file'] || path.join(os.homedir(), '.mcpdog', 'mcpdog.pid');
 
-    // 确定启动模式
-    let enableStdio = true;  // 默认启用
-    let enableHttp = true;   // 默认启用
-    let enableDashboard = !options['no-dashboard']; // 默认启用，除非明确禁用
-
-    if (options['stdio-only']) {
-      enableStdio = true;
-      enableHttp = false;
-    } else if (options['http-only']) {
-      enableStdio = false;
-      enableHttp = true;
+    if (options['mcp-http-port']) {
+      console.warn('[MCPDog] --mcp-http-port 已弃用：/mcp 与 dashboard 同端口，此选项被忽略。');
+    }
+    if (options['http-only']) {
+      throw new Error('--http-only 已移除：/mcp 与 dashboard 同端口，无法只开 HTTP 传输。');
     }
 
     return {
-      enableStdio,
-      enableHttp,
-      enableDashboard,
+      enableStdio: true,
+      enableDashboard: !options['no-dashboard'],
       dashboardPort,
-      httpPort,
       daemonPort,
-      pidFile
+      pidFile,
     };
   }
 
@@ -110,17 +99,17 @@ ${CLIUtils.colorize('Available actions:', 'yellow')}
 🚀 ${CLIUtils.colorize('MCPDog started successfully!', 'green')}
 
 📊 ${CLIUtils.colorize('Services:', 'cyan')}${startupConfig.enableStdio ? `
-  ✅ Stdio Transport: Ready (for MCP clients)` : ''}${startupConfig.enableHttp ? `
-  ✅ HTTP Transport: ${CLIUtils.colorize(`http://localhost:${startupConfig.httpPort}`, 'blue')}` : ''}${startupConfig.enableDashboard ? `
-  ✅ Dashboard UI: ${CLIUtils.colorize(`http://localhost:${startupConfig.dashboardPort}`, 'blue')}` : ''}
+  ✅ Stdio Transport: Ready (for MCP clients)` : ''}${startupConfig.enableDashboard ? `
+  ✅ Dashboard UI: ${CLIUtils.colorize(`http://localhost:${startupConfig.dashboardPort}`, 'blue')}
+  ✅ MCP Endpoint: ${CLIUtils.colorize(`http://127.0.0.1:${startupConfig.dashboardPort}/mcp`, 'blue')} (StreamableHTTP, same port as dashboard)` : ''}
 
 🔧 ${CLIUtils.colorize('Configuration:', 'cyan')}
   📁 Config: ${this.configManager.getConfigPath()}
   🔧 Servers: ${Object.keys(enabledServers).join(', ')} (${this.getTotalToolCount()} tools)
 
 📋 ${CLIUtils.colorize('Usage:', 'cyan')}${startupConfig.enableStdio ? `
-  • MCP Clients: Use 'npx mcpdog@latest' in client config` : ''}${startupConfig.enableHttp ? `
-  • HTTP Clients: Connect to http://localhost:${startupConfig.httpPort}` : ''}${startupConfig.enableDashboard ? `  
+  • MCP Clients: Use 'npx mcpdog@latest' in client config` : ''}${startupConfig.enableDashboard ? `
+  • MCP Clients (HTTP): Connect to http://127.0.0.1:${startupConfig.dashboardPort}/mcp
   • Manage: Visit http://localhost:${startupConfig.dashboardPort}` : ''}
 
 ⏹️  ${CLIUtils.colorize('Stop:', 'cyan')} npx mcpdog@latest stop
@@ -137,9 +126,6 @@ ${CLIUtils.colorize('[INFO]', 'cyan')} Daemon is running in the background
     if (finalConfig.dashboardPort !== startupConfig.dashboardPort) {
       CLIUtils.warn(`Dashboard port ${startupConfig.dashboardPort} is busy, using ${finalConfig.dashboardPort}`);
     }
-    if (finalConfig.httpPort !== startupConfig.httpPort) {
-      CLIUtils.warn(`HTTP port ${startupConfig.httpPort} is busy, using ${finalConfig.httpPort}`);
-    }
 
     // 确保 .mcpdog 目录存在
     const mcpdogDir = path.dirname(finalConfig.pidFile);
@@ -149,14 +135,10 @@ ${CLIUtils.colorize('[INFO]', 'cyan')} Daemon is running in the background
       // 目录可能已存在，忽略错误
     }
 
-    // 创建 daemon 配置
+    // 创建 daemon 配置：dashboard 端口由 startWebServer(port) 参数传入，不在此处配置
     const daemonConfig: DaemonConfig = {
       configPath: this.configManager.getConfigPath(),
       ipcPort: finalConfig.daemonPort,
-      dashboardPort: finalConfig.enableDashboard ? finalConfig.dashboardPort : undefined,
-      httpPort: finalConfig.enableHttp ? finalConfig.httpPort : undefined,
-      enableHttp: finalConfig.enableHttp,
-      enableStdio: finalConfig.enableStdio,
       pidFile: finalConfig.pidFile,
     };
 
@@ -188,10 +170,6 @@ ${CLIUtils.colorize('[INFO]', 'cyan')} Daemon is running in the background
     
     if (config.enableDashboard) {
       result.dashboardPort = await this.findAvailablePort(config.dashboardPort);
-    }
-    
-    if (config.enableHttp) {
-      result.httpPort = await this.findAvailablePort(config.httpPort);
     }
     
     return result;
@@ -284,35 +262,32 @@ ${CLIUtils.colorize('Usage:', 'yellow')}
 
 ${CLIUtils.colorize('Options:', 'yellow')}
   -c, --config <path>        Configuration file path (default: ./mcpdog.config.json)
-  --dashboard-port <port>    Dashboard UI port (default: 38881, auto-detected)
-  --mcp-http-port <port>     HTTP transport port (default: 4000, auto-detected)
+  --dashboard-port <port>    Dashboard UI + MCP endpoint port (default: 38881, auto-detected)
   --daemon-port <port>       IPC daemon port (default: 9999)
   --pid-file <path>          PID file location (default: ~/.mcpdog/mcpdog.pid)
   
   --stdio-only               Only enable stdio transport + dashboard
-  --http-only                Only enable HTTP transport + dashboard
-  --no-dashboard             Disable dashboard UI
+  --no-dashboard             Disable dashboard UI (and the /mcp endpoint)
   
   --web-port <port>          Deprecated, use --dashboard-port
+  --mcp-http-port <port>     Deprecated and ignored, /mcp shares the dashboard port
+  --http-only                Removed, /mcp shares the dashboard port
   --help                     Show this help message
 
 ${CLIUtils.colorize('Default Behavior:', 'yellow')}
   By default, 'mcpdog start' enables all services:
   • Stdio Transport (for MCP clients)
-  • HTTP Transport (for remote/web clients)  
-  • Dashboard UI (for management)
+  • Dashboard UI + StreamableHTTP MCP endpoint (same port, http://127.0.0.1:38881/mcp)
 
 ${CLIUtils.colorize('Examples:', 'yellow')}
   mcpdog start                              # Start all services
   mcpdog start --stdio-only                 # Only stdio + dashboard
-  mcpdog start --http-only                  # Only HTTP + dashboard
-  mcpdog start --no-dashboard               # All transports, no dashboard
-  mcpdog start --dashboard-port 3001        # Custom dashboard port
-  mcpdog start --mcp-http-port 4001         # Custom HTTP port
+  mcpdog start --no-dashboard               # Stdio only, no dashboard
+  mcpdog start --dashboard-port 3001        # Custom dashboard/MCP port
 
 ${CLIUtils.colorize('After starting:', 'yellow')}
-  • MCP Clients: Use 'npx mcpdog@latest' in client config
-  • HTTP Clients: Connect to http://localhost:4000
+  • MCP Clients (stdio): Use 'npx mcpdog@latest' in client config
+  • MCP Clients (HTTP): Connect to http://127.0.0.1:38881/mcp
   • Management: Visit http://localhost:38881
   • Stop: mcpdog stop
 `);

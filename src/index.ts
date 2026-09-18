@@ -2,7 +2,6 @@ import { createInterface } from 'readline';
 import { MCPDogServer } from './core/mcpdog-server.js';
 import { MCPDogConfig, MCPMessage, MCPNotification, MCPNotificationRequest, MCPResponse, MCPRequest } from './types/index.js';
 import { ConfigManager } from './config/config-manager.js';
-import { StreamableHttpMCPServer } from './streamable-http-server.js';
 
 export class StdioMCPServer {
   private server: MCPDogServer;
@@ -132,10 +131,17 @@ export class StdioMCPServer {
   }
 }
 
+interface ParsedArgs {
+  configPath?: string;
+  transport?: string;
+  /** 只服务于已移除的 HTTP 传输的参数（--port / --web-port），仅用于给出迁移指引 */
+  removedEntry?: string;
+}
+
 // Parse command line arguments
-function parseArgs(): { configPath?: string; webPort?: number; transport?: string; port?: number } {
+function parseArgs(): ParsedArgs {
   const args = process.argv.slice(2);
-  const result: { configPath?: string; webPort?: number; transport?: string; port?: number } = {};
+  const result: ParsedArgs = {};
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -143,14 +149,13 @@ function parseArgs(): { configPath?: string; webPort?: number; transport?: strin
     if (arg === '--config' || arg === '-c') {
       result.configPath = args[i + 1];
       i++;
-    } else if (arg === '--web-port') {
-      result.webPort = parseInt(args[i + 1], 10);
-      i++;
     } else if (arg === '--transport' || arg === '-t') {
+      // 仍需解析该参数：stdio 是合法取值，只有非 stdio 才属于已移除的 HTTP 入口
       result.transport = args[i + 1];
       i++;
-    } else if (arg === '--port' || arg === '-p') {
-      result.port = parseInt(args[i + 1], 10);
+    } else if (arg === '--port' || arg === '-p' || arg === '--web-port') {
+      // 这两个参数只服务于已移除的 HTTP 传输入口
+      result.removedEntry = `${arg} ${args[i + 1] ?? ''}`.trim();
       i++;
     } else if (arg === '--help' || arg === '-h') {
       console.log(`
@@ -160,21 +165,15 @@ Usage: mcpdog [options]
 
 Options:
   -c, --config <path>     Configuration file path (default: ./mcpdog.config.json)
-  -t, --transport <type>  Transport protocol: stdio (default) or streamable-http
-  -p, --port <port>       Port for HTTP transport (default: 4000)
-  --web-port <port>       Enable web interface on port (experimental)
   -h, --help              Show this help message
 
 Examples:
   mcpdog                                    # Start with stdio transport
-  mcpdog --transport streamable-http        # Start with HTTP transport on default port
-  mcpdog --transport streamable-http --port 8080  # Start with HTTP transport on port 8080
   mcpdog --config ./my-config.json         # Use custom config file
-  mcpdog --web-port 3000                   # Enable web interface (not yet implemented)
 
-Transport Types:
-  stdio           - Standard input/output (default, for MCP clients like Claude Desktop)
-  streamable-http - HTTP-based transport with optional Server-Sent Events
+StreamableHTTP MCP is served by the resident daemon, not by this command:
+  mcpdog daemon start
+  http://127.0.0.1:38881/mcp
 
 For more information, visit: https://github.com/SIE-Operations-and-Maintenance-Team/mcpdog
       `);
@@ -187,31 +186,25 @@ For more information, visit: https://github.com/SIE-Operations-and-Maintenance-T
 
 // Main program entry point
 async function main(): Promise<void> {
-  const { configPath, webPort, transport, port } = parseArgs();
+  const { configPath, transport, removedEntry } = parseArgs();
 
-  if (webPort) {
-    console.error('Web interface not yet implemented');
+  // 非 stdio 传输（含 streamable-http）与 --port / --web-port 均已随 HTTP 传输入口移除
+  const removed = removedEntry ?? (transport && transport !== 'stdio' ? `--transport ${transport}` : undefined);
+
+  if (removed) {
+    process.stderr.write(
+      `MCPDog: ${removed} 已移除。\n` +
+      '请用 `mcpdog daemon start` 启动常驻服务，然后以 URL 接入：\n' +
+      '  http://127.0.0.1:38881/mcp\n'
+    );
     process.exit(1);
   }
 
   const configManager = new ConfigManager(configPath);
   await configManager.loadConfig(); // Load config before passing to server
 
-  // Choose transport type
-  const transportType = transport || 'stdio';
-  
-  if (transportType === 'streamable-http') {
-    const httpPort = port || 4000;
-    const httpServer = new StreamableHttpMCPServer(configManager, httpPort);
-    await httpServer.start();
-  } else if (transportType === 'stdio') {
-    const mcpServer = new StdioMCPServer(configManager);
-    await mcpServer.start();
-  } else {
-    console.error(`Unknown transport type: ${transportType}`);
-    console.error('Supported transports: stdio, streamable-http');
-    process.exit(1);
-  }
+  const mcpServer = new StdioMCPServer(configManager);
+  await mcpServer.start();
 }
 
 // Only start server when this file is run directly, not when imported

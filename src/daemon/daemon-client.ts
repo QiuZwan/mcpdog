@@ -186,20 +186,42 @@ export class DaemonClient extends EventEmitter {
   }
 
   // Public API
-  async connect(): Promise<void> {
+  // timeoutMs 可选：超时则 reject 并中止本次连接尝试。
+  // 不传时行为与从前一致（不设上限），避免影响 status / reload / proxy 等既有调用方。
+  async connect(timeoutMs?: number): Promise<void> {
     return new Promise((resolve, reject) => {
-      const onConnect = () => {
+      let timer: NodeJS.Timeout | undefined;
+
+      const cleanup = () => {
+        this.off('connected', onConnect);
         this.off('error', onError);
+        if (timer) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+      };
+
+      const onConnect = () => {
+        cleanup();
         resolve();
       };
 
       const onError = (error: Error) => {
-        this.off('connected', onConnect);
+        cleanup();
         reject(error);
       };
 
       this.once('connected', onConnect);
       this.once('error', onError);
+
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          cleanup();
+          // 中止仍在进行的连接尝试：否则超时后 socket 可能才连上，留下悬挂句柄
+          this.socket.destroy();
+          reject(new Error(`Connection to daemon timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }
 
       this.socket.connect(this.config.port!, this.config.host!);
     });
@@ -238,6 +260,11 @@ export class DaemonClient extends EventEmitter {
   // Reload configuration
   reloadConfig(): void {
     this.send({ type: 'reload-config' });
+  }
+
+  // Request graceful shutdown (daemon runs stop() then exits)
+  shutdown(): void {
+    this.send({ type: 'shutdown' });
   }
 
   get connected(): boolean {

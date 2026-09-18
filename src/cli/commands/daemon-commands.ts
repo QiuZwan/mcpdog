@@ -9,12 +9,17 @@ import { DaemonClient } from '../../daemon/daemon-client.js';
 import { startDaemonFileLogging } from '../../logging/daemon-file-logger.js';
 import fs from 'fs/promises';
 import { readFileSync } from 'fs';
+import { spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer } from 'net';
 import os from 'os';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// IPC 优雅停机请求的连接超时：端口半开或被占满时 connect 会一直挂着，
+// 不设上限就永远到不了强杀兜底
+const SHUTDOWN_CONNECT_TIMEOUT_MS = 3000;
 
 export class DaemonCommands {
   private configManager: ConfigManager;
@@ -119,7 +124,7 @@ export class DaemonCommands {
           }
 
           CLIUtils.info(`Detected running daemon v${runningVersion ?? 'unknown (old format)'} (PID: ${runningInfo.pid}), upgrading to v${currentVersion}...`);
-          await this.stopDaemonByPid(runningInfo.pid);
+          await this.stopDaemonByPid(runningInfo.pid, port);
           try {
             await fs.unlink(pidFile);
           } catch {
@@ -143,7 +148,6 @@ export class DaemonCommands {
       const daemon = new MCPDogDaemon({
         configPath: this.configManager.getConfigPath(),
         ipcPort: port,
-        webPort,
         pidFile
       });
 
@@ -195,6 +199,7 @@ export class DaemonCommands {
 
   async stop(args: string[], options: any): Promise<void> {
     const pidFile = options['pid-file'] || this.getDefaultPidFile();
+    const port = parseInt(options['daemon-port']) || 9999;
 
     try {
       const pid = await this.getPidFromFile(pidFile);
@@ -203,13 +208,15 @@ export class DaemonCommands {
         process.exit(1);
       }
 
-      await this.stopDaemonByPid(pid);
+      const graceful = await this.stopDaemonByPid(pid, port);
 
-      // Clean up PID file
-      try {
-        await fs.unlink(pidFile);
-      } catch (error) {
-        // Ignore errors
+      if (!graceful) {
+        // 强杀兜底时 daemon 的 stop() 不会执行，PID 文件只能由这里清理
+        try {
+          await fs.unlink(pidFile);
+        } catch {
+          // PID 文件已被删除则忽略
+        }
       }
 
       CLIUtils.success('Daemon stopped');
@@ -235,7 +242,7 @@ export class DaemonCommands {
       }
       if (running) {
         CLIUtils.info(`Stopping daemon (PID: ${info.pid})...`);
-        await this.stopDaemonByPid(info.pid);
+        await this.stopDaemonByPid(info.pid, parseInt(options['daemon-port']) || 9999);
         try {
           await fs.unlink(pidFile);
         } catch {
@@ -248,26 +255,79 @@ export class DaemonCommands {
     await this.start(args, options);
   }
 
-  // 停止指定 PID 的 daemon：SIGTERM 优雅退出，超时 SIGKILL 兜底
-  private async stopDaemonByPid(pid: number): Promise<void> {
-    process.kill(pid, 'SIGTERM');
+  // 停止指定 PID 的 daemon：先经 IPC 请求优雅停机（Windows 上 SIGTERM 无法触发 daemon 的
+  // handler，见 requestShutdown），轮询等待进程消失；超时再强杀兜底。
+  // 返回 true 表示优雅停机成功（PID 文件等由 daemon 自身清理），false 表示走了强杀。
+  private async stopDaemonByPid(pid: number, ipcPort: number): Promise<boolean> {
+    const shutdownRequested = await this.requestShutdown(ipcPort);
 
-    let attempts = 0;
-    while (attempts < 30) {
-      try {
-        process.kill(pid, 0); // Check if process still exists
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        attempts++;
-      } catch (error) {
-        // Process has stopped
-        break;
+    if (shutdownRequested) {
+      let attempts = 0;
+      while (attempts < 30) {
+        try {
+          process.kill(pid, 0); // Check if process still exists
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          attempts++;
+        } catch (error) {
+          // Process has stopped
+          break;
+        }
+      }
+
+      if (attempts < 30) {
+        return true;
       }
     }
 
-    if (attempts >= 30) {
-      CLIUtils.warn('Daemon did not stop within expected time, forcing termination...');
-      process.kill(pid, 'SIGKILL');
+    // shutdown 请求没送出去（daemon 在不同 IPC 端口或已死）时不等 30s，直接强杀兜底
+    CLIUtils.warn('Daemon did not stop gracefully, forcing termination...');
+    await this.forceKill(pid);
+    return false;
+  }
+
+  // 请求 daemon 走优雅停机（stop() + process.exit）。
+  // 返回 false 表示请求没能送达（daemon 已死或端口不通），交给强杀兜底。
+  private async requestShutdown(ipcPort: number): Promise<boolean> {
+    const client = new DaemonClient({
+      port: ipcPort,
+      clientType: 'cli',
+      reconnect: false,
+      silent: true
+    });
+
+    // daemon 退出会让 socket 报错；EventEmitter 对无监听的 'error' 事件会直接抛出，
+    // 会把一次成功的停机变成 CLI 崩溃，所以这里必须挂一个兜底监听
+    client.on('error', () => {});
+
+    try {
+      await client.connect(SHUTDOWN_CONNECT_TIMEOUT_MS);
+      client.shutdown();
+      return true;
+    } catch (error) {
+      CLIUtils.verbose(`IPC shutdown request failed, falling back to kill: ${(error as Error).message}`);
+      return false;
+    } finally {
+      client.disconnect();
     }
+  }
+
+  // 强杀兜底：Windows 上 process.kill 的 SIGKILL 同样是 TerminateProcess，用 taskkill /F 更明确。
+  // /T 必须带：Windows 没有 job object，父进程被杀不会带走子进程，缺 /T 会把子服务器 node 进程
+  // 全部留成孤儿 —— 而这条兜底路径正是优雅停机失败时走的、最可能产生孤儿的那条。
+  private async forceKill(pid: number): Promise<void> {
+    if (process.platform !== 'win32') {
+      process.kill(pid, 'SIGKILL');
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      const killer = spawn('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+      killer.on('close', () => resolve());
+      killer.on('error', (error) => {
+        CLIUtils.warn(`taskkill failed: ${error.message}`);
+        resolve();
+      });
+    });
   }
 
   async status(args: string[], options: any): Promise<void> {
@@ -480,6 +540,7 @@ ${CLIUtils.colorize('Quick Start:', 'cyan')}
         description: 'Stop MCPDog daemon',
         handler: this.stop.bind(this),
         options: {
+          'daemon-port': 'Daemon IPC port (default: 9999)',
           'pid-file': 'PID file path'
         }
       },

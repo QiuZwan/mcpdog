@@ -1415,12 +1415,28 @@ export class DaemonWebServer {
     });
   }
 
-  async stop(): Promise<void> {
-    return new Promise((resolve) => {
-      this.server.close(() => {
-        console.log('[DAEMON-WEB] Web server stopped');
-        resolve();
-      });
+  /**
+   * 关闭 dashboard / /mcp 所在的 HTTP 服务。
+   * 顺序：先关 MCP session（否则已连接的 SSE 流不会被主动关闭）→ 再关 Socket.IO 与 HTTP server。
+   */
+  async close(): Promise<void> {
+    await this.mcpEndpoint?.close();
+
+    // io.close() 会断开所有 socket 并关闭它持有的 http server，回调在连接清空后触发
+    await new Promise<void>((resolve) => {
+      this.io.close(() => resolve());
     });
+
+    // 兜底再关一次 http server：不让「端口是否释放」依赖 socket.io 的内部实现
+    // （重复 close 会带 ERR_SERVER_NOT_RUNNING 回调，不影响结果）
+    await new Promise<void>((resolve) => {
+      this.server.close(() => resolve());
+    });
+
+    console.log('[DAEMON-WEB] Web server stopped');
+  }
+
+  async stop(): Promise<void> {
+    return this.close();
   }
 }

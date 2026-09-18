@@ -5,10 +5,9 @@
 
 import { EventEmitter } from 'events';
 import { createServer, Server as NetServer } from 'net';
-import { Server as HttpServer } from 'http';
 import { MCPDogServer } from '../core/mcpdog-server.js';
 import { ConfigManager } from '../config/config-manager.js';
-import { StreamableHttpMCPServer } from '../streamable-http-server.js';
+import type { DaemonWebServer } from './daemon-web-server.js';
 import path from 'path';
 import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
@@ -18,13 +17,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export interface DaemonConfig {
   configPath: string;
   ipcPort?: number;
-  dashboardPort?: number;
-  httpPort?: number;
-  enableHttp?: boolean;
-  enableStdio?: boolean;
   pidFile?: string;
-  // backward compatibility
-  webPort?: number;
 }
 
 export interface DaemonClient {
@@ -38,8 +31,7 @@ export class MCPDogDaemon extends EventEmitter {
   private mcpServer: MCPDogServer;
   private configManager: ConfigManager;
   private ipcServer: NetServer;
-  private webServer?: HttpServer;
-  private httpMCPServer?: StreamableHttpMCPServer;
+  private webServer?: DaemonWebServer;
   private clients = new Map<string, DaemonClient>();
   private config: DaemonConfig;
   private isRunning = false;
@@ -224,6 +216,22 @@ export class MCPDogDaemon extends EventEmitter {
         await this.reloadConfig();
         break;
 
+      case 'shutdown':
+        // 客户端要求优雅停机：先跑完整的 stop()（关 web server 释放端口、清 PID 文件、
+        // 停子服务器），再退出进程。
+        // Windows 上 `daemon stop` 不能靠 SIGTERM 触发本进程的 handler
+        // （process.kill 在 Windows 是 TerminateProcess），这条 IPC 消息是 Windows 上
+        // 唯一的优雅停机入口。
+        console.log('[DAEMON] Shutdown requested by client');
+        try {
+          await this.stop();
+          process.exit(0);
+        } catch (error) {
+          console.error('[DAEMON] Shutdown failed:', error);
+          process.exit(1);
+        }
+        break;
+
       case 'get-tools':
         const tools = await this.mcpServer.getToolRouter().getAllTools();
         this.sendToClient(clientId, {
@@ -366,20 +374,6 @@ export class MCPDogDaemon extends EventEmitter {
         });
       });
 
-      // Start HTTP MCP server if enabled
-      if (this.config.enableHttp && this.config.httpPort) {
-        try {
-          // Get auth token from environment variable
-          const authToken = process.env.MCPDOG_AUTH_TOKEN;
-          this.httpMCPServer = new StreamableHttpMCPServer(this.configManager, this.config.httpPort, authToken);
-          await this.httpMCPServer.start();
-          console.log(`[DAEMON] HTTP MCP server started on port ${this.config.httpPort}${authToken ? ' with authentication' : ''}`);
-        } catch (error) {
-          console.error(`[DAEMON] Failed to start HTTP MCP server on port ${this.config.httpPort}:`, error);
-          // HTTP transport is optional, continue without it
-        }
-      }
-
       // Write PID file（含版本号，供 daemon start 检测版本差异自动升级重启）
       if (this.config.pidFile) {
         let version = 'unknown';
@@ -415,14 +409,14 @@ export class MCPDogDaemon extends EventEmitter {
       });
       this.clients.clear();
 
-      // Stop HTTP MCP server if running
-      if (this.httpMCPServer) {
+      // Stop dashboard / MCP HTTP server if running
+      // （必须真正 close：否则 daemon 停止后端口仍被占用，且已连接的 MCP session 不会被关闭）
+      if (this.webServer) {
         try {
-          // StreamableHttpMCPServer doesn't have a direct stop method, 
-          // but it should clean up on process exit
-          console.log('[DAEMON] HTTP MCP server stopped');
+          await this.webServer.close();
+          this.webServer = undefined;
         } catch (error) {
-          console.error('[DAEMON] Error stopping HTTP MCP server:', error);
+          console.error('[DAEMON] Error closing web server:', error);
         }
       }
 
@@ -464,6 +458,8 @@ export class MCPDogDaemon extends EventEmitter {
     const { DaemonWebServer } = await import('./daemon-web-server.js');
     const webServer = new DaemonWebServer(this, port);
     await webServer.start();
+    // 持有实例，stop() 才能关掉 HTTP 服务并释放端口
+    this.webServer = webServer;
     console.log(`[DAEMON] Web interface started on port ${port}`);
   }
 }

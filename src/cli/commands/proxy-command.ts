@@ -5,7 +5,6 @@
 import { ConfigManager } from '../../config/config-manager.js';
 import { CLIUtils } from '../cli-utils.js';
 import { StdioMCPServer } from '../../index.js';
-import { StreamableHttpMCPServer } from '../../streamable-http-server.js';
 import { promises as fs } from 'fs';
 import { spawn } from 'child_process';
 import { Socket } from 'net';
@@ -35,9 +34,14 @@ export class ProxyCommand {
 
     // Check transport type
     const transport = options.transport || 'stdio';
-    
+
     if (transport === 'streamable-http') {
-      await this.startHttpMode(options);
+      process.stderr.write(
+        'MCPDog: --transport streamable-http 已移除。\n' +
+        '请用 `mcpdog daemon start` 启动常驻服务，然后以 URL 接入：\n' +
+        '  http://127.0.0.1:38881/mcp\n'
+      );
+      process.exit(1);
     } else if (options['web-port']) {
       await this.startWebMode(options);
     } else {
@@ -101,35 +105,6 @@ export class ProxyCommand {
     // In MCP mode, suppress all output to avoid JSON parsing errors
     // Just switch to stdio mode silently
     await this.startStdioMode(options);
-  }
-
-  private async startHttpMode(options: Record<string, any>): Promise<void> {
-    const httpPort = parseInt(options.port) || 4000;
-    
-    try {
-      const httpServer = new StreamableHttpMCPServer(this.configManager, httpPort);
-      
-      // Graceful shutdown handling
-      process.on('SIGINT', () => {
-        process.exit(0);
-      });
-      
-      process.on('SIGTERM', () => {
-        process.exit(0);
-      });
-      
-      await httpServer.start();
-      
-      // Prevent command exit from terminating process
-      await new Promise(() => {}); // Wait forever
-
-    } catch (error) {
-      // Only output error on connection failure, then exit immediately
-      // Use process.stderr.write instead of CLIUtils to avoid color codes
-      process.stderr.write(`MCPDog: Failed to start HTTP server on port ${httpPort}\n`);
-      process.stderr.write(`Error: ${(error as Error).message}\n`);
-      process.exit(1);
-    }
   }
 
   /**
@@ -307,24 +282,20 @@ ${CLIUtils.colorize('Usage:', 'yellow')}
   mcpdog proxy [options]
 
 ${CLIUtils.colorize('Options:', 'yellow')}
-  --transport <type>    Transport protocol: stdio (default) or streamable-http
-  -p, --port <port>     Port for HTTP transport (default: 4000)
-  --daemon-port <port>  Connect to daemon on specific port (default: 9999, stdio mode only)
+  --daemon-port <port>  Connect to daemon on specific port (default: 9999)
   --help               Show this help message
 
 ${CLIUtils.colorize('Description:', 'yellow')}
-  This command starts MCPDog and acts as a proxy for MCP clients. It supports
-  both stdio (for traditional MCP clients) and HTTP (for web-based clients).
+  This command starts MCPDog and acts as a proxy for MCP clients over stdio.
 
 ${CLIUtils.colorize('Transport Types:', 'yellow')}
-  stdio           - Standard input/output (default, for MCP clients like Claude Desktop)
-  streamable-http - HTTP-based transport with JSON-RPC over HTTP
+  stdio - Standard input/output (default, for MCP clients like Claude Desktop)
+  StreamableHTTP is no longer started by this command: it is served by the resident
+  daemon at http://127.0.0.1:38881/mcp (same port as the dashboard).
 
 ${CLIUtils.colorize('Examples:', 'yellow')}
   mcpdog proxy                                    # Start with stdio transport
-  mcpdog proxy --transport streamable-http        # Start HTTP server on port 4000
-  mcpdog proxy --transport streamable-http --port 8080  # Start HTTP server on port 8080
-  mcpdog proxy --daemon-port 9999                # Use specific daemon port (stdio only)
+  mcpdog proxy --daemon-port 9999                # Use specific daemon port
 
 ${CLIUtils.colorize('MCP Client Configuration:', 'yellow')}
   
@@ -336,14 +307,13 @@ ${CLIUtils.colorize('MCP Client Configuration:', 'yellow')}
     }
   }
   
-  For streamable HTTP transport:
-  First start server manually: mcpdog --transport streamable-http --port 4000
-  Then configure client:
+  For StreamableHTTP transport: start the daemon first (mcpdog daemon start),
+  then configure the client:
   {
     "mcpServers": {
       "mcpdog-http": {
         "type": "streamable-http",
-        "url": "http://localhost:4000"
+        "url": "http://127.0.0.1:38881/mcp"
       }
     }
   }
