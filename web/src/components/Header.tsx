@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Github } from 'lucide-react';
 import { apiClient } from '../utils/api';
+import { AutostartToggle } from './AutostartToggle';
 import { ThemeToggle } from './ThemeToggle';
 
 const GITHUB_URL = 'https://github.com/SIE-Operations-and-Maintenance-Team/mcpdog';
@@ -49,6 +50,7 @@ export const Header: React.FC = () => {
             v{version}
           </span>
         )}
+        <AutostartToggle />
         <ThemeToggle className="!text-white" />
         <a
           href={GITHUB_URL}

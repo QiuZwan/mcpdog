@@ -12,6 +12,7 @@
 
 import { CLIUtils } from '../cli-utils.js';
 import { ConfigManager } from '../../config/config-manager.js';
+import { isShellAutostart, readWindowsRunValue } from '../../utils/autostart.js';
 import { promises as fs } from 'fs';
 import { existsSync } from 'fs';
 import path from 'path';
@@ -142,6 +143,17 @@ WantedBy=default.target
   // ---------- 子命令 ----------
 
   private async install(): Promise<void> {
+    // 桌面壳已接管自启时不再写第二份，否则登录时会起两个 daemon 互相争端口
+    if (process.platform === 'win32') {
+      const existing = await readWindowsRunValue();
+      if (isShellAutostart(existing)) {
+        CLIUtils.error('开机自启已由 MCPDog 桌面版接管，无需再安装 CLI 自启。');
+        CLIUtils.info(`当前注册表项: ${existing}`);
+        CLIUtils.info('如需改用 CLI 自启，请先在桌面版中关闭自启。');
+        process.exit(1);
+      }
+    }
+
     const nodeExe = process.execPath;
     const cliEntry = this.getCliEntry();
     const configPath = this.configManager.getConfigPath();
@@ -201,6 +213,15 @@ WantedBy=default.target
   }
 
   private async status(): Promise<void> {
+    if (process.platform === 'win32') {
+      const existing = await readWindowsRunValue();
+      if (isShellAutostart(existing)) {
+        CLIUtils.info('开机自启由 MCPDog 桌面版接管');
+        CLIUtils.info(`注册表项: ${existing}`);
+        return;
+      }
+    }
+
     const serviceFile = this.getServiceFilePath();
 
     if (!existsSync(serviceFile)) {

@@ -18,6 +18,7 @@ import { ServerNameValidator } from '../utils/server-name-validator.js';
 import { parseClaudeJson, buildImportPlan, ClaudeMCPEntry } from '../utils/claude-mcp-importer.js';
 import { createExpressAuthMiddleware } from '../middleware/auth.js';
 import { McpHttpEndpoint } from './mcp-http-endpoint.js';
+import { getAutostartState, setAutostart } from '../utils/autostart.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -317,7 +318,32 @@ export class DaemonWebServer {
     router.get('/logs/:serverName', this.handleGetServerLogs.bind(this));
     router.delete('/logs/:serverName', this.handleClearServerLogs.bind(this));
     router.get('/logs/:serverName/stats', this.handleGetServerLogStats.bind(this));
-    
+
+    // 开机自启：形态由 MCPDOG_SHELL_EXE 裁决（见 src/utils/autostart.ts）
+    router.get('/autostart', async (_req, res) => {
+      try {
+        const state = await getAutostartState();
+        res.json({ ...state, supported: process.platform === 'win32' });
+      } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+      }
+    });
+
+    router.put('/autostart', async (req, res) => {
+      try {
+        const enabled = !!req.body?.enabled;
+        await setAutostart(enabled, {
+          nodeExe: process.execPath,
+          cliEntry: path.join(__dirname, '../cli/cli-main.js'),
+          configPath: this.configManager.getConfigPath(),
+        });
+        const state = await getAutostartState();
+        res.json({ ...state, supported: process.platform === 'win32' });
+      } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+      }
+    });
+
     return router;
   }
 
