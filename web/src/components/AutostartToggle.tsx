@@ -35,7 +35,11 @@ export const AutostartToggle: React.FC = () => {
       setEnabled(!!d?.enabled);
       setForm(String(d?.form ?? 'none'));
     } catch (error) {
-      console.error('切换开机自启失败:', error);
+      // 失败必须让用户看见：只写 console.error 时点电源图标等于什么都没发生。
+      // 这里保留原状态（成功才 setEnabled），并弹出原因 —— 与 AddServerModal /
+      // ServerPanel 的既有做法一致（本项目没有 toast 系统）。
+      const reason = error instanceof Error ? error.message : String(error);
+      alert(`切换开机自启失败：\n\n${reason}`);
     } finally {
       setBusy(false);
     }

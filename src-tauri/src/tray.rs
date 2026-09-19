@@ -9,15 +9,45 @@ use tauri::{
     AppHandle,
 };
 
-/// 用系统默认浏览器打开管理页；失败只记日志不阻断（对齐先例）
+/// 托盘图标 id。状态刷新要靠它从 AppHandle 找回托盘实例 —— 不设 id 就取不回来，
+/// 托盘提示只能停在构建时的那一个字符串（spec §8.3 要求显示运行状态）。
+pub const TRAY_ID: &str = "mcpdog-tray";
+
+/// 按当前 daemon 状态刷新托盘提示。supervisor 在状态变化时调用。
+pub fn refresh_tooltip(app: &AppHandle) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    let ver = app.package_info().version.clone();
+    let tip = format!("MCPDog v{ver} · {}", supervisor::state().label());
+    if let Err(e) = tray.set_tooltip(Some(tip.as_str())) {
+        eprintln!("[tray] 更新托盘提示失败: {e}");
+    }
+}
+
+/// 用系统默认浏览器打开管理页；失败必须让用户看见。
+///
+/// 发布构建 `windows_subsystem = "windows"` 没有控制台，旧实现只写 stderr ——
+/// daemon 未就绪时点「打开管理页」等于什么都没发生。改为弹原生错误对话框。
 pub fn open_admin() {
     match supervisor::admin_url() {
         Some(url) => {
             if let Err(e) = tauri_plugin_opener::open_url(url, None::<&str>) {
                 eprintln!("[tray] 打开管理页失败: {e}");
+                supervisor::show_error_dialog("MCPDog", &format!("打开管理页失败：\n{e}"));
             }
         }
-        None => eprintln!("[tray] daemon 未就绪，无法打开管理页"),
+        None => {
+            eprintln!("[tray] daemon 未就绪，无法打开管理页");
+            supervisor::show_error_dialog(
+                "MCPDog",
+                &format!(
+                    "daemon 尚未就绪（端口 {} 无响应），暂时无法打开管理页。\n当前状态：{}",
+                    supervisor::DEFAULT_WEB_PORT,
+                    supervisor::state().label()
+                ),
+            );
+        }
     }
 }
 
@@ -58,9 +88,10 @@ pub fn mcp_menu(app: &AppHandle) -> tauri::Result<()> {
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &sep, &about, &check, &restart, &quit_item])?;
 
-    let _tray = TrayIconBuilder::new()
+    let _tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(app.default_window_icon().unwrap().clone())
-        .tooltip(format!("MCPDog v{ver}"))
+        // 初始提示就带上状态：发布构建无控制台，托盘提示是唯一常驻的运行状态出口
+        .tooltip(format!("MCPDog v{ver} · {}", supervisor::state().label()))
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id.as_ref() {

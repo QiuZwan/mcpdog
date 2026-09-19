@@ -5,7 +5,7 @@
  * bundle.resources 打进 NSIS 安装包。Node 版本在此固定，升级时改这一处常量。
  */
 
-import { execFileSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { createHash } from 'crypto';
 import { createWriteStream, existsSync, mkdirSync, cpSync, rmSync, readFileSync, writeFileSync } from 'fs';
 import { pipeline } from 'stream/promises';
@@ -96,6 +96,53 @@ function extractZip(zipPath, destDir) {
   );
 }
 
+/**
+ * 把 daemon 的生产依赖装进 resources/app。
+ *
+ * 为什么必须装：daemon 的 import 图是裸说明符 ESM（cross-spawn / axios / eventsource /
+ * express / socket.io / cors 等）。Node 按「导入文件所在目录」向上找 node_modules，
+ * 开发态能找到仓库根的 node_modules，但 NSIS 装到 C:\Program Files\MCPDog\ 之后，
+ * 向上只能走到 C:\ —— 找不到包，daemon 在模块加载阶段就退出。安装包体积只有 ~27MB
+ * 正是「一个依赖都没带」的旁证，而壳的全部价值都押在这个进程上。
+ *
+ * 用 `npm ci --omit=dev` 而不是 esbuild 打包：锁文件即安装内容，与仓库依赖完全一致，
+ * 不需要为 daemon 维护第二份打包配置；npm 本来就是构建本仓库的前提。
+ * 子服务器走 npx 自行下载，不在这个 node_modules 的范围内。
+ */
+function installAppDependencies(appTarget) {
+  // 锁文件必须与 package.json 一起进去：`npm ci` 只按锁文件安装，且缺锁文件会直接失败。
+  cpSync(path.join(ROOT, 'package-lock.json'), path.join(appTarget, 'package-lock.json'));
+
+  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  console.log('安装 daemon 生产依赖 (npm ci --omit=dev) ...');
+  try {
+    // 必须走 shell：Windows 上直接 spawn `npm.cmd` 会以 EINVAL 失败
+    // （Node 的 CVE-2024-27980 修复后禁止无 shell 执行批处理）。
+    // 命令串是常量，不存在注入面。execSync 用单个字符串，避免 execFileSync + args +
+    // shell 触发的 DEP0190 告警。
+    execSync(`${npm} ci --omit=dev`, {
+      cwd: appTarget,
+      stdio: 'inherit',
+      // 跳过 puppeteer / playwright 的浏览器下载：它们不在 daemon 的 import 图里
+      // （子服务器由 npx 自行取包），但 postinstall 会额外拉数百 MB 浏览器，
+      // 拖慢每次打包、也会污染构建机的缓存目录。
+      env: {
+        ...process.env,
+        PUPPETEER_SKIP_DOWNLOAD: '1',
+        PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1',
+      },
+    });
+  } catch (error) {
+    throw new Error(`安装 daemon 生产依赖失败（${error.message}）；resources/app 无法独立启动 daemon`);
+  }
+
+  // 没有 node_modules 的产物必然在安装后报 ERR_MODULE_NOT_FOUND，这里前置拦下，
+  // 避免把一个「装完但起不来」的安装包发出去。
+  if (!existsSync(path.join(appTarget, 'node_modules'))) {
+    throw new Error(`npm ci 未产出 ${path.join(appTarget, 'node_modules')}`);
+  }
+}
+
 async function main() {
   assertBuilt();
 
@@ -131,6 +178,9 @@ async function main() {
   mkdirSync(path.join(appTarget, 'web'), { recursive: true });
   cpSync(path.join(ROOT, 'web', 'dist'), path.join(appTarget, 'web', 'dist'), { recursive: true });
   cpSync(path.join(ROOT, 'package.json'), path.join(appTarget, 'package.json'));
+
+  // 3) 生产依赖：没有它 resources/app 在仓库外无法加载 daemon（裸说明符 ESM 解析不到包）
+  installAppDependencies(appTarget);
 
   const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf-8'));
   writeFileSync(

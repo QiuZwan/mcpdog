@@ -58,10 +58,6 @@ function reg(args: string[]): Promise<{ code: number; stdout: string; stderr: st
   });
 }
 
-export function isAutostartSupported(): boolean {
-  return process.platform === 'win32';
-}
-
 // reg.exe 的退出码 1 表示「项或值不存在」，这是预期情况（读时视为未配置、删时视为幂等成功）。
 // 其余非零退出是真实故障，必须抛出，不能一律读成「没配置」——否则 service install 的冲突检测
 // 会 fail open（查出错照样写 VBS），且 setAutostart(false) 删除失败也会假报成功。
@@ -69,7 +65,7 @@ export function isAutostartSupported(): boolean {
 const REG_EXIT_NOT_FOUND = 1;
 
 export async function readWindowsRunValue(): Promise<string | null> {
-  if (!isAutostartSupported()) return null;
+  if (process.platform !== 'win32') return null;
   const { code, stdout, stderr } = await reg(['query', RUN_KEY, '/v', RUN_VALUE_NAME]);
   if (code === REG_EXIT_NOT_FOUND) return null;
   if (code !== 0) throw new Error(`读取注册表失败 (reg.exe exit ${code}): ${stderr.trim()}`);
@@ -77,7 +73,7 @@ export async function readWindowsRunValue(): Promise<string | null> {
 }
 
 export async function writeWindowsRunValue(command: string | null): Promise<void> {
-  if (!isAutostartSupported()) {
+  if (process.platform !== 'win32') {
     throw new Error('开机自启目前仅支持 Windows');
   }
   if (command === null) {
@@ -97,8 +93,9 @@ export async function writeWindowsRunValue(command: string | null): Promise<void
 export async function getAutostartState(): Promise<{ form: AutostartForm; enabled: boolean; command: string | null }> {
   const existing = await readWindowsRunValue();
   if (!existing) return { form: 'none', enabled: false, command: null };
-  // 值里出现 --autostart 说明指向桌面壳，否则视为指向 daemon 的旧形态
-  const form: AutostartForm = /--autostart\b/.test(existing) ? 'shell' : 'daemon';
+  // 复用 isShellAutostart 而不是再写一次 /--autostart\b/：两处各写一份迟早会漂移，
+  // 而「注册表值指向壳还是 daemon」正是本模块唯一的裁决点。
+  const form: AutostartForm = isShellAutostart(existing) ? 'shell' : 'daemon';
   return { form, enabled: true, command: existing };
 }
 
