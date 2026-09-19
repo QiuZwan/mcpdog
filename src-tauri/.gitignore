@@ -1,0 +1,8 @@
+/target
+/resources
+# updater 签名私钥：Task 6 会在 src-tauri/ 下生成 mcpdog-updater.key，
+# 它是真私钥，必须在此拦截而不是依赖事后检查 git status
+*.key
+mcpdog-updater.key
+# Tauri 2 构建期生成的 schema / ACL 产物（约 350KB），与 ssh-mcp-server 同规则不入库
+/gen
