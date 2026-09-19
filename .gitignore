@@ -72,6 +72,9 @@ $RECYCLE.BIN/
 # codegraph 本地索引
 .codegraph/
 
+# 桌面壳资源准备脚本的 Node 分发包缓存（src-tauri/target 与 resources 由 src-tauri/.gitignore 拦截）
+/.cache/
+
 # 本地设计/实施文档，不入库
 doc/
 docs/

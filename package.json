@@ -11,7 +11,10 @@
     "test": "vitest",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "web": "node dist/index.js --web-port 38881",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "shell:resources": "node scripts/prepare-shell-resources.mjs",
+    "shell:build": "npm run build && npm run shell:resources && cd src-tauri && cargo build --release",
+    "shell:package": "npm run build && npm run shell:resources && cd src-tauri && npx --yes @tauri-apps/cli build"
   },
   "bin": {
     "mcpdog": "./dist/cli/cli-main.js"

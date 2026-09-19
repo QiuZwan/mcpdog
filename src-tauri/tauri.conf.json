@@ -16,6 +16,11 @@
     "icon": ["icons/icon.ico"],
     "targets": ["nsis"],
     "createUpdaterArtifacts": true,
+    "resources": {
+      "resources/node": "node",
+      "resources/app": "app",
+      "resources/VERSION": "VERSION"
+    },
     "windows": {
       "nsis": {
         "languages": ["SimpChinese"]
