@@ -18,11 +18,15 @@ jobs:
       - uses: actions/checkout@v5
       - id: check
         run: |
-          if [ -f src-tauri/tauri.conf.json ]; then
+          # 两个文件都必须在：tauri.conf.json 声明 bundle.resources，
+          # prepare-shell-resources.mjs 产出它所指向的资源目录。
+          # 只检查前者会在壳做到一半时激活打包 job 然后失败 —— tauri-build 在
+          # bundle.resources 的源路径缺失时是硬失败，不是警告。
+          if [ -f src-tauri/tauri.conf.json ] && [ -f scripts/prepare-shell-resources.mjs ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "未检测到 src-tauri/tauri.conf.json，跳过桌面壳打包。" >> "$GITHUB_STEP_SUMMARY"
+            echo "桌面壳尚未完整（需要 src-tauri/tauri.conf.json 与 scripts/prepare-shell-resources.mjs 同时存在），跳过打包。" >> "$GITHUB_STEP_SUMMARY"
           fi
 
   # 发版包：产出 npm tarball 并创建 GitHub Release。
