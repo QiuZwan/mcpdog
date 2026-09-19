@@ -25,6 +25,57 @@ jobs:
             echo "未检测到 src-tauri/tauri.conf.json，跳过桌面壳打包。" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  # 发版包：产出 npm tarball 并创建 GitHub Release。
+  # 这一 job 不依赖桌面壳，因此任何 tag 都能得到一个可下载的发版包。
+  package:
+    name: Build release package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm ci --prefix web
+
+      - name: Verify before packaging
+        # 发版前必须过闸：产物一旦挂到 Release 上就是对外可见的
+        run: |
+          npx tsc --noEmit
+          npx vitest run
+          npx vitest run --config vitest.integration.config.ts
+
+      - name: Build and pack
+        # npm pack 不会触发 prepublishOnly，所以先显式构建；
+        # package.json 的 files 字段决定 tarball 内含 dist/、web/dist/、README、LICENSE
+        run: |
+          npm run build
+          npm pack
+          ls -l *.tgz
+
+      - name: Extract release notes from CHANGELOG
+        run: node scripts/extract-release-notes.mjs > release-notes.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: '*.tgz'
+          fail_on_unmatched_files: true
+
   publish-npm:
     name: Publish to npm
     runs-on: ubuntu-latest
@@ -48,16 +99,21 @@ jobs:
           npm ci
           npm ci --prefix web
 
-      - name: Verify before publishing
-        # 发版前必须过闸：npm 的版本一旦发布，撤回窗口极短且不可靠
+      - name: Detect npm token
+        # 未配置 NPM_TOKEN 时跳过而不是让整个 tag 变红 —— 发版包由 package job 负责，
+        # npm 发布是可选的一步
+        id: token
         run: |
-          npx tsc --noEmit
-          npx vitest run
-          npx vitest run --config vitest.integration.config.ts
+          if [ -n "${{ secrets.NPM_TOKEN }}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 NPM_TOKEN，跳过 npm 发布（发版包已由 package job 产出）。" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Publish
-        # package.json 的 prepublishOnly 会执行 npm run build（含前端构建），
-        # 因此 dist/ 与 web/dist/ 都是本次源码构建的产物
+        if: steps.token.outputs.present == 'true'
+        # package.json 的 prepublishOnly 会执行 npm run build（含前端构建）
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -67,8 +123,7 @@ jobs:
     needs: detect-shell
     if: needs.detect-shell.outputs.present == 'true'
     runs-on: windows-latest
-    # 只有这个 job 需要写权限（上传 Release 资产）；发布 npm 的 job 不需要，
-    # 所以不把 contents: write 提到 workflow 级
+    # 只有这个 job 需要写权限（上传 Release 资产）
     permissions:
       contents: write
     env:
@@ -108,7 +163,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
-      - name: Upload release assets
+      - name: Upload installer to the same Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
