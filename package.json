@@ -14,7 +14,7 @@
     "prepublishOnly": "npm run build",
     "shell:resources": "node scripts/prepare-shell-resources.mjs",
     "shell:build": "npm run build && npm run shell:resources && cd src-tauri && cargo build --release",
-    "shell:package": "npm run build && npm run shell:resources && cd src-tauri && npx --yes @tauri-apps/cli build"
+    "shell:package": "npm run build && npm run shell:resources && cd src-tauri && npx --yes @tauri-apps/cli build && cd .. && node scripts/generate-updater-manifest.mjs"
   },
   "bin": {
     "mcpdog": "./dist/cli/cli-main.js"

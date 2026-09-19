@@ -1,5 +1,5 @@
 //! 系统托盘。菜单结构对齐组织内两个先例（MCP-DB-Tools TrayHost / ssh-mcp-server tray.rs）：
-//! 打开管理页 / 关于 / 重启服务 / 退出，双击图标同样打开管理页。
+//! 打开管理页 / 关于 / 检查更新 / 重启服务 / 退出，双击图标同样打开管理页。
 //! 纯托盘模式 —— 无 WebView 主窗口，管理页一律在系统默认浏览器中打开。
 
 use crate::supervisor;
@@ -53,9 +53,10 @@ pub fn mcp_menu(app: &AppHandle) -> tauri::Result<()> {
     let sep = PredefinedMenuItem::separator(app)?;
     let about_label = format!("关于 MCPDog  v{ver}");
     let about = MenuItem::with_id(app, "about", about_label.as_str(), true, None::<&str>)?;
+    let check = MenuItem::with_id(app, "check-update", "检查更新", true, None::<&str>)?;
     let restart = MenuItem::with_id(app, "restart", "重启服务", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &sep, &about, &restart, &quit_item])?;
+    let menu = Menu::with_items(app, &[&open, &sep, &about, &check, &restart, &quit_item])?;
 
     let _tray = TrayIconBuilder::new()
         .icon(app.default_window_icon().unwrap().clone())
@@ -65,6 +66,7 @@ pub fn mcp_menu(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open-admin" => open_admin(),
             "about" => show_about(app),
+            "check-update" => check_update(app),
             "restart" => restart_service(),
             "quit" => quit(app),
             _ => {}
@@ -100,6 +102,85 @@ fn show_about(app: &AppHandle) {
         .message(detail)
         .title("关于 MCPDog")
         .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::Ok)
+        .show(|_| {});
+}
+
+/// 「检查更新」：读远端 latest.json 与本地版本比对，结果一律用原生弹窗呈现。
+///
+/// 网络请求必须离开菜单回调线程（理由同 `restart_service` / `quit`）：GitHub 往返慢起来
+/// 可达十几秒，直接在回调里 await 会把托盘冻住。
+///
+/// 失败必须弹窗而不是只 `eprintln!` —— 发布构建带 `windows_subsystem = "windows"`，
+/// 没有控制台，写 stderr 用户什么都看不到。端点 404（例如 Release 里没有 latest.json）
+/// 也会走到这里，这正是「静默永远报已是最新」那类故障的可见化出口。
+///
+/// 只检查与提示、不下载安装：`Update::download_and_install` 在 Windows 上会运行安装程序并以
+/// `std::process::exit(0)` 结束本进程（绕过 `main` 末尾的 `supervisor::shutdown()`），
+/// 那条路径需要真机端到端验证（计划 Task 6 的 Step 5.2）。因此文案如实说明不会自动安装。
+fn check_update(app: &AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    use tauri_plugin_updater::UpdaterExt;
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let current = app.package_info().version.to_string();
+
+        let updater = match app.updater() {
+            Ok(updater) => updater,
+            Err(e) => {
+                show_check_error(&app, &e.to_string());
+                return;
+            }
+        };
+
+        match updater.check().await {
+            // 远端没有更新的版本
+            Ok(None) => {
+                app.dialog()
+                    .message(format!("当前已是最新版本 v{current}。"))
+                    .title("检查更新")
+                    .kind(MessageDialogKind::Info)
+                    .buttons(MessageDialogButtons::Ok)
+                    .show(|_| {});
+            }
+            // 有新版本：如实说明只提示不安装，并给出安装包下载入口
+            Ok(Some(update)) => {
+                let url = update.download_url.to_string();
+                app.dialog()
+                    .message(format!(
+                        "发现新版本 v{}（当前 v{current}）。\n\n\
+                         桌面版目前只做检查与提示，不会自动安装。\n\
+                         可打开下面的链接下载安装包后手动安装：\n{url}",
+                        update.version
+                    ))
+                    .title("检查更新")
+                    .kind(MessageDialogKind::Info)
+                    .buttons(MessageDialogButtons::OkCancel)
+                    // 用非阻塞 show 而不是 blocking_show：等用户点按钮的时间可能是分钟级，
+                    // 不该占着异步运行时的线程（这里只需拿到结果再开浏览器）
+                    .show(move |confirmed| {
+                        if confirmed {
+                            if let Err(e) = tauri_plugin_opener::open_url(url, None::<&str>) {
+                                eprintln!("[tray] 打开下载链接失败: {e}");
+                            }
+                        }
+                    });
+            }
+            // 失败原因必须让用户看见（网络不通 / endpoint 404 / 验签不通过都走到这里）
+            Err(e) => show_check_error(&app, &e.to_string()),
+        }
+    });
+}
+
+/// 检查更新失败的弹窗：带上原因，不静默
+fn show_check_error(app: &AppHandle, reason: &str) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+    app.dialog()
+        .message(format!("检查更新失败：\n{reason}"))
+        .title("检查更新")
+        .kind(MessageDialogKind::Error)
         .buttons(MessageDialogButtons::Ok)
         .show(|_| {});
 }

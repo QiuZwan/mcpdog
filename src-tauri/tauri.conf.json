@@ -29,8 +29,10 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
-      "endpoints": []
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIxNDE1REYxM0Y2N0RGQ0IKUldUTDMyYy84VjFCSVl3QXlaZkxYM0d6RzRlMEg2VHllbzhxZ25na3NpMlpSL3J6b21EdEhTZnEK",
+      "endpoints": [
+        "https://github.com/QiuZwan/mcpdog/releases/latest/download/latest.json"
+      ]
     }
   }
 }

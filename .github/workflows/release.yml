@@ -167,9 +167,19 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
+      - name: Generate updater manifest
+        # `tauri build` 只产出安装包与 .sig，**不产出 latest.json**（官方把该文件归给
+        # tauri-action，CLI 里既无此文件名也无清单必需的 pub_date）。缺了它 Release 里就没有
+        # latest.json，自更新端点返回 404 且完全无提示。这里用与本地 shell:package 相同的脚本拼装，
+        # 保证本地与 CI 产物一致。
+        run: node scripts/generate-updater-manifest.mjs
+
       - name: Upload installer to the same Release
         uses: softprops/action-gh-release@v2
         with:
+          # 缺资产必须变红：latest.json 曾经整整缺失而这一步仍是绿的，
+          # 于是自更新端点静默 404 却无人发现（兄弟上传步骤已有该标志）
+          fail_on_unmatched_files: true
           files: |
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/latest.json

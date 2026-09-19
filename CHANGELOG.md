@@ -12,6 +12,13 @@
 - **变更**：接入配置生成改为 HTTP URL 形态——`mcpdog config mcp-config`（含 `--json`）与 Web 界面「连接 MCPDOG」弹窗均改以 URL 接入为主推方案，stdio 降为兼容路径。Web 弹窗默认选中 HTTP 页签，URL 由当前页面 origin 推导（改端口自动跟随，`localhost` 会改写为 `127.0.0.1` 以匹配仅回环监听的 daemon）；CLI 生成的是固定默认端口 `http://127.0.0.1:38881/mcp`，并在输出中注明该端口仅为默认值（38881 被占用时 daemon 会自动顺延，需按实际端口替换），以及 daemon 带 `MCPDOG_AUTH_TOKEN` 启动时需自行补 `headers.Authorization`。
 - **修复**：删除会在同一进程内重复拉起全部子服务器的旧 HTTP 实现（`mcpdog start` 路径上可复现），HTTP 传输统一由 daemon 的 `/mcp` 端点提供。
 
+### 桌面版（Windows）
+
+- **新增**：Windows 桌面版（NSIS 安装包）：纯托盘常驻，内嵌 Node 运行时，无需用户自装 Node。
+- **新增**：桌面版接管开机自启（HKCU Run），此时 `mcpdog service install` 会提示已被接管。
+- **新增**：更新检查（GitHub Releases + minisign 验签）：托盘新增「检查更新」，读取 Release 上的 `latest.json` 与本地版本比对，有新版本时弹窗提示版本号并可直接打开安装包下载链接；检查失败（网络不通、端点 404、验签不通过）会把原因显示在弹窗里。**当前仅做检查与提示，不会自动安装** —— 需手动运行下载到的安装包。
+- **已知限制**：托盘图标目前是生成的占位图标，尚待替换为正式品牌图标。
+
 ## [1.0.9] - 2026-09-14
 
 - **修复（关键）**：下游 stdio server 进程异常退出后重连失效。`sendRequest` 判定进程已死并调用 `connect()`，但 `connect()` 顶部的 `isConnected` 守卫在标志位陈旧时直接 `return`（且只 `console.error`、不写日志管理器，界面上看不到），调用方随即无条件记录「Reconnection successful」——**日志说重连成功，请求却被写进已断开的管道，最终要等 30 秒超时才失败**。根因是 `isConnected` 与进程 `'exit'` 事件之间存在时序窗口（`exitCode` 在 libuv 回调里同步置位，`'exit'` 事件要等 nextTick 才发出）。现改为以进程实况（`process`/`stdin`/`killed`/`exitCode`）作为唯一权威判据，标志位陈旧时复位并清理后走重连，重连后再复核一次进程可用性，不再假报成功。
