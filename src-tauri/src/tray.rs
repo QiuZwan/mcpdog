@@ -21,14 +21,30 @@ pub fn open_admin() {
     }
 }
 
-/// 触发软重启：关掉当前 daemon 子进程后由守护线程重新拉起
+/// 触发软重启：关掉当前 daemon 子进程后由守护线程重新拉起。
+///
+/// 不能在菜单回调线程上直接调用：`request_restart` 全程持 `SUPERVISOR` 锁，而锁内
+/// 既有 `terminate_tree`（等进程消失最长 30s）又有 `ensure_running_locked` 的端口轮询
+/// （最长 15s），直接调用会让托盘冻结数十秒。投递到独立线程后菜单立刻恢复响应。
 fn restart_service() {
-    supervisor::request_restart();
+    std::thread::spawn(supervisor::request_restart);
 }
 
+/// 退出：等 daemon 真正退出后再结束壳。
+///
+/// 等待同样必须放在独立线程（原因同 `restart_service`）。注意 `timeout` **不是**这次调用
+/// 总时长的上界：先要取 `SUPERVISOR` 锁（等待无界，锁内可能正在 `terminate_tree` 的
+/// 30s 轮询），锁内还要 `stop_process` 等 child 消失（又最长 30s），最后才是等守护线程
+/// 收敛的 `timeout`。最坏可达分钟级，只有离线程才能不冻住托盘。
+/// `AppHandle::exit` 可从任意线程调用 —— 它只投递退出请求，所以等完再请求退出是安全的。
 fn quit(app: &AppHandle) {
-    supervisor::shutdown();
-    app.exit(0);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if !supervisor::shutdown_and_wait(std::time::Duration::from_secs(15)) {
+            eprintln!("[tray] daemon 未在 15s 内退出，仍然退出壳");
+        }
+        app.exit(0);
+    });
 }
 
 pub fn mcp_menu(app: &AppHandle) -> tauri::Result<()> {

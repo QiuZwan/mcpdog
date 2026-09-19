@@ -35,6 +35,10 @@ static LAST_SPAWN: Mutex<Option<Instant>> = Mutex::new(None);
 static SUPERVISOR: Mutex<()> = Mutex::new(());
 /// 守护线程句柄（Task 5 的 shutdown_and_wait 要靠它等线程收敛）
 static SUPERVISE_THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+/// 壳是否已进入退出流程。置位后不再接受重启请求 —— 否则「退出」途中被点「重启服务」
+/// 会 spawn 一个无人监管的 daemon（在退避窗口内即可触发）。
+/// 单向闩：只由 shutdown_and_wait 置位，此后进程即将退出，没有复位场景。
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PidFileInfo {
@@ -538,12 +542,27 @@ fn stop_process(pid: u32) {
 }
 
 pub fn request_restart() {
+    // 壳已进入退出流程时不再重启：否则「退出」途中被点「重启服务」会 spawn 一个
+    // 无人监管的 daemon（在退避窗口内即可触发）。这里先做一次无锁快速判断 ——
+    // 停机段会持 SUPERVISOR 到 stop_process 结束，没必要为此白等。
+    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        eprintln!("[supervisor] 壳正在退出，忽略重启请求");
+        return;
+    }
+
     // 与守护循环互斥：否则循环的 ensure_running 与本函数的 stop_process + ensure_running
     // 会交错，各起一个 daemon 去争同一组端口。
     let _guard = match SUPERVISOR.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
+
+    // 取锁后再复查一次：上面那次判断与这里之间，退出流程可能刚好置位。
+    // 与守护循环「退避 sleep 之后再复查 SHOULD_RUN」是同一个模式。
+    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        eprintln!("[supervisor] 壳正在退出，忽略重启请求");
+        return;
+    }
 
     let pid = CHILD
         .lock()
@@ -575,6 +594,66 @@ pub fn shutdown() {
         stop_process(pid);
     }
     // 有意不动 EXTERNAL_PID：那是用户自己起的 daemon，壳退出不该把它带走。
+}
+
+/// 关闭 daemon 并等待其真正退出。返回是否在超时前退出。
+/// 托盘「退出」必须走这个而不是 shutdown() —— 直接 exit(0) 会让 daemon 来不及清理
+/// PID 文件与子服务器，下次启动会误判为半死实例。
+///
+/// 停机段与等待段分开，中间**必须放锁**：
+/// 1. 停机段持 `SUPERVISOR`：否则与守护循环的退避重启交错，会出现「已退出又被拉起」
+///    与两个 daemon 争端口 —— 那正是 R2 要消除的状态。
+/// 2. 等待段不持锁：守护循环要走完 `return` 必须先取同一把锁。若一直握着，
+///    `is_finished()` 恒为 false，等待永远等不到收敛，必然等满超时并打印**假的**
+///    「未收敛」—— 那等于把「等循环真的停下」这件事做废。
+///
+/// 只停 `CHILD`，不含 `EXTERNAL_PID` —— 与 `shutdown()` 同一套策略（见其注释）：
+/// 那是用户自己起的 daemon，壳退出不该把它带走。接管来的 PID 在杀之前也不再校验身份，
+/// 一旦 PID 被复用，把它交给 `taskkill /T /F` 就是杀一个无关进程。
+/// 代价：接管情形下点「退出」后那个 daemon 继续运行（用户可用 CLI 停它）；
+/// 本函数要解决的「半死实例」只发生在我们自己 spawn 的 child 上。
+///
+/// `timeout` 只界定「等守护线程收敛」这一段，**不是**函数总时长的上界：
+/// 前面的锁等待无界（循环在 `ensure_running_locked` 里最长持锁约 15s），
+/// `stop_process` 里的 `terminate_tree` 另加最长 30s。所以调用方必须在别的线程上等。
+pub fn shutdown_and_wait(timeout: Duration) -> bool {
+    // 停机段：置标志 + 停自己的 child，整段在锁内，出作用域即释放锁
+    let target = {
+        let _guard = match SUPERVISOR.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        SHOULD_RUN.store(false, Ordering::SeqCst);
+        SHUTTING_DOWN.store(true, Ordering::SeqCst);
+
+        let pid = CHILD.lock().ok().and_then(|g| g.as_ref().map(|c| c.id()));
+        if let Some(pid) = pid {
+            stop_process(pid);
+        }
+        pid
+    };
+
+    let deadline = Instant::now() + timeout;
+
+    // 等待段（不持锁）：守护线程在退避 sleep 中也能因 SHOULD_RUN=false 而退出，
+    // 醒来后能取到锁、复查后 return —— 这里的收敛因此是真的
+    let handle = SUPERVISE_THREAD.lock().ok().and_then(|mut g| g.take());
+    if let Some(handle) = handle {
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            eprintln!("[supervisor] 守护线程未在超时内收敛，放弃等待（进程即将退出）");
+        }
+    }
+
+    match target {
+        Some(pid) => !process_alive(pid),
+        None => true,
+    }
 }
 
 /// 当前 daemon 的 base URL（未就绪返回 None）
