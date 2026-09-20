@@ -7,9 +7,10 @@ import { ConfigManager } from '../../config/config-manager.js';
 import { MCPDogDaemon } from '../../daemon/mcpdog-daemon.js';
 import { DaemonClient } from '../../daemon/daemon-client.js';
 import { startDaemonFileLogging } from '../../logging/daemon-file-logger.js';
+import { parsePidFileContent, looksLikeOurDaemon } from '../../utils/pid-file.js';
 import fs from 'fs/promises';
 import { readFileSync } from 'fs';
-import { spawn } from 'child_process';
+import { spawn, execFile } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer } from 'net';
@@ -27,6 +28,31 @@ const SHUTDOWN_CONNECT_TIMEOUT_MS = 3000;
 // 5s 足以覆盖 stop() 关 web server + 停子服务器的耗时。
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 5000;
 const GRACEFUL_SHUTDOWN_POLL_INTERVAL_MS = 250;
+
+/**
+ * 读取某 PID 的命令行，用于判定该进程是不是我们的 daemon。
+ * 非 Windows 或读取失败时返回 null —— 表示「无法确认」，调用方须按此处理而不是当成「不是我们」。
+ */
+export async function readProcessCommandLine(pid: number): Promise<string | null> {
+  if (process.platform !== 'win32') return null;
+  return new Promise((resolve) => {
+    execFile(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`,
+      ],
+      { windowsHide: true, timeout: 5000 },
+      (error, stdout) => {
+        if (error) return resolve(null);
+        const line = String(stdout || '').trim();
+        resolve(line ? line : null);
+      },
+    );
+  });
+}
 
 export class DaemonCommands {
   private configManager: ConfigManager;
@@ -110,35 +136,31 @@ export class DaemonCommands {
       // Ensure ~/.mcpdog directory exists
       await this.ensureMCPDogDir();
 
+      // daemon 通常以 detached + stdio:'ignore' 启动，输出全部丢弃；所以要在任何可能提前退出的
+      // 判定之前开启文件日志 —— 否则「拒绝启动」这类失败连一行痕迹都不留
+      // （线上事故：陈旧 PID 文件导致 exit(1)，当天完全没有日志，排查只能靠反推）
+      const daemonLogFile = startDaemonFileLogging(this.mcpdogDir);
+      CLIUtils.info(`Daemon log file: ${daemonLogFile}`);
+
       // Check if daemon is already running；版本不同（或旧格式 PID 文件无版本信息）时自动升级重启
       const runningInfo = await this.getDaemonInfoFromFile(pidFile);
-      if (runningInfo) {
-        let running = false;
+      if (runningInfo && (await this.isOurDaemonRunning(runningInfo.pid, pidFile))) {
+        const currentVersion = this.readPackageVersion();
+        const runningVersion = runningInfo.version;
+
+        if (runningVersion && runningVersion === currentVersion) {
+          CLIUtils.error(`Daemon is already running (PID: ${runningInfo.pid}, v${runningVersion})`);
+          process.exit(1);
+        }
+
+        CLIUtils.info(`Detected running daemon v${runningVersion ?? 'unknown (old format)'} (PID: ${runningInfo.pid}), upgrading to v${currentVersion}...`);
+        await this.stopDaemonByPid(runningInfo.pid, port);
         try {
-          process.kill(runningInfo.pid, 0);
-          running = true;
+          await fs.unlink(pidFile);
         } catch {
-          running = false;
+          // PID 文件不存在则忽略
         }
-
-        if (running) {
-          const currentVersion = this.readPackageVersion();
-          const runningVersion = runningInfo.version;
-
-          if (runningVersion && runningVersion === currentVersion) {
-            CLIUtils.error(`Daemon is already running (PID: ${runningInfo.pid}, v${runningVersion})`);
-            process.exit(1);
-          }
-
-          CLIUtils.info(`Detected running daemon v${runningVersion ?? 'unknown (old format)'} (PID: ${runningInfo.pid}), upgrading to v${currentVersion}...`);
-          await this.stopDaemonByPid(runningInfo.pid, port);
-          try {
-            await fs.unlink(pidFile);
-          } catch {
-            // PID 文件不存在则忽略
-          }
-          CLIUtils.success(`Old daemon stopped, starting v${currentVersion}...`);
-        }
+        CLIUtils.success(`Old daemon stopped, starting v${currentVersion}...`);
       }
 
       // If web-port is not specified, default to starting web server with auto port detection
@@ -146,11 +168,6 @@ export class DaemonCommands {
         webPort = await this.findAvailablePort(38881);
         CLIUtils.info(`Auto-detected available web port: ${webPort}`);
       }
-
-      // daemon 通常以 detached + stdio:'ignore' 启动，输出全部丢弃；先开启文件日志再初始化，
-      // 后续所有启动/运行日志都有据可查
-      const daemonLogFile = startDaemonFileLogging(this.mcpdogDir);
-      CLIUtils.info(`Daemon log file: ${daemonLogFile}`);
 
       const daemon = new MCPDogDaemon({
         configPath: this.configManager.getConfigPath(),
@@ -546,22 +563,49 @@ ${CLIUtils.colorize('Quick Start:', 'cyan')}
   // 旧格式：纯数字 PID（无版本信息）
   private async getDaemonInfoFromFile(pidFile: string): Promise<{ pid: number; version: string | null } | null> {
     try {
-      const content = (await fs.readFile(pidFile, 'utf-8')).trim();
-      if (!content) return null;
-
-      if (content.startsWith('{')) {
-        const info = JSON.parse(content);
-        if (typeof info.pid === 'number') {
-          return { pid: info.pid, version: info.version ?? null };
-        }
-        return null;
-      }
-
-      const pid = parseInt(content);
-      return isNaN(pid) ? null : { pid, version: null };
+      return parsePidFileContent(await fs.readFile(pidFile, 'utf-8'));
     } catch (error) {
       return null;
     }
+  }
+
+  /**
+   * PID 文件里的 PID 是否**真的是我们的 daemon**。
+   *
+   * 只判「PID 存活」是不够的：daemon 被非正常终止（重启、强杀）时不会清理 PID 文件，
+   * 而重启后该 PID 很容易被别的程序复用。此时若按存活认定「已在运行」：
+   * - 版本恰好相同 → 直接 exit(1)，daemon 在整个登录会话里都起不来；
+   * - 版本不同 → 更糟，会去 taskkill 一个无关进程。
+   *
+   * 读不到命令行时返回 true（无法确认身份，保持保守行为）并记日志；
+   * 只有明确读到「不是我们的 daemon」才忽略该 PID 记录并清掉陈旧文件。
+   */
+  private async isOurDaemonRunning(pid: number, pidFile: string): Promise<boolean> {
+    let alive = false;
+    try {
+      process.kill(pid, 0);
+      alive = true;
+    } catch {
+      alive = false;
+    }
+    if (!alive) return false;
+
+    const commandLine = await readProcessCommandLine(pid);
+    if (commandLine === null) {
+      CLIUtils.warn(`PID ${pid} 存活但读不到命令行，无法确认身份，按「已在运行」处理`);
+      return true;
+    }
+    if (looksLikeOurDaemon(commandLine)) return true;
+
+    CLIUtils.warn(
+      `PID 文件陈旧：PID ${pid} 现属于其他进程（${commandLine.slice(0, 140)}），忽略该记录并清理`,
+    );
+    try {
+      await fs.unlink(pidFile);
+    } catch {
+      // 文件可能已被清理，忽略
+    }
+    return false;
   }
 
   private async getPidFromFile(pidFile: string): Promise<number | null> {

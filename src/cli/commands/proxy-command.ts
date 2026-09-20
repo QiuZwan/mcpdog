@@ -5,6 +5,7 @@
 import { ConfigManager } from '../../config/config-manager.js';
 import { CLIUtils } from '../cli-utils.js';
 import { StdioMCPServer } from '../../index.js';
+import { parsePidFileContent } from '../../utils/pid-file.js';
 import { promises as fs } from 'fs';
 import { spawn } from 'child_process';
 import { Socket } from 'net';
@@ -187,12 +188,14 @@ export class ProxyCommand {
 
   /**
    * Get PID from PID file
+   *
+   * 必须走共享解析器：daemon 写的是 `{"pid":N,"version":"x"}`，而这里原先用 parseInt 解析，
+   * 对 JSON 恒得 NaN → 判定「daemon 未运行」→ 每次会话都去拉起一个注定失败的子进程，
+   * 「daemon 已在运行」的检测形同虚设。
    */
   private async getPidFromFile(pidFile: string): Promise<number | null> {
     try {
-      const pidStr = await fs.readFile(pidFile, 'utf-8');
-      const pid = parseInt(pidStr.trim());
-      return isNaN(pid) ? null : pid;
+      return parsePidFileContent(await fs.readFile(pidFile, 'utf-8'))?.pid ?? null;
     } catch {
       return null;
     }

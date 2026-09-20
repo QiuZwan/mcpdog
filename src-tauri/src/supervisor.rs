@@ -450,6 +450,29 @@ fn spawn_daemon() {
         cmd.env("PATH", path);
     }
 
+    // 子进程的 stdout/stderr 落盘：发布构建是 windows_subsystem="windows"，没有控制台，
+    // 子进程的输出无处可看。而 daemon 自己的文件日志开启排在其「已在运行」判定之后，
+    // 所以早期失败（例如陈旧 PID 文件导致的 exit(1)）在 daemon 日志里一行都不留 ——
+    // 线上那次排查就是卡在这里。这里把那段输出兜住。
+    let log_path = mcpdog_dir().join("shell-daemon.log");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => match file.try_clone() {
+            Ok(err_file) => {
+                cmd.stdout(std::process::Stdio::from(file));
+                cmd.stderr(std::process::Stdio::from(err_file));
+            }
+            Err(e) => eprintln!("[supervisor] 复制日志句柄失败（{e}），子进程输出不落盘"),
+        },
+        Err(e) => eprintln!(
+            "[supervisor] 打开 {} 失败（{e}），子进程输出不落盘",
+            log_path.display()
+        ),
+    }
+
     match cmd.spawn() {
         Ok(child) => {
             let pid = child.id();
