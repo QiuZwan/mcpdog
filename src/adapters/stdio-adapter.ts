@@ -3,6 +3,7 @@ import { ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import { MCPServerConfig, MCPTool, MCPRequest, MCPResponse, ServerAdapter } from '../types/index.js';
 import { globalLogManager } from '../logging/server-log-manager.js';
+import { decodeChildLine } from '../utils/child-output.js';
 
 export class StdioAdapter extends EventEmitter implements ServerAdapter {
   public readonly name: string;
@@ -18,7 +19,10 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
   }> = new Map();
 
   private buffer: string = '';
-  private stderrBuffer: string = '';
+  /** stderr 按**字节**缓冲：解码要按行做（见 utils/child-output），不能在 chunk 边界上切 */
+  private stderrBytes: Buffer = Buffer.alloc(0);
+  /** 最近几行 stderr，用于子进程退出时把「它说了什么」带进失败原因 */
+  private recentStderr: string[] = [];
   
   // Process stability monitoring
   private crashCount: number = 0;
@@ -217,27 +221,21 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
     });
 
     this.process.stderr?.on('data', (data: Buffer) => {
-      this.stderrBuffer += data.toString();
-      const lines = this.stderrBuffer.split('\n');
-      this.stderrBuffer = lines.pop() || ''; // Keep incomplete line
+      // 按字节拼接、按行解码：子进程可能是 cmd.exe（OEM/GBK）也可能是 Node 程序（UTF-8），
+      // 判定编码需要整行，且不能跨 chunk 切断多字节字符
+      this.stderrBytes = Buffer.concat([this.stderrBytes, data]);
 
-      for (const line of lines) {
-        if (line.trim()) {
-          const stderr = line.trim();
-          // Add debug logging for stderr
-          console.error(`[${this.name}] DEBUG: STDERR received - length: ${stderr.length}`);
-          console.error(`[${this.name}] DEBUG: STDERR content: ${stderr.substring(0, 200)}`);
-          // Log to log manager
-          globalLogManager.addServerOutput(this.name, stderr, 'stderr');
-          this.emit('log', { stream: 'stderr', data: stderr }); // Ensure all output is sent to frontend
-          
-          // Detect browsermcp stack overflow errors
-          if (stderr.includes('Maximum call stack size exceeded') || 
-              stderr.includes('RangeError')) {
-            console.error(`⚠️ ${this.name} detected stack overflow, will auto-restart on next request`);
-            globalLogManager.addLog(this.name, 'warn', 'Stack overflow detected, will auto-restart on next request', 'system');
-          }
-        }
+      let start = 0;
+      let newlineAt: number;
+      while ((newlineAt = this.stderrBytes.indexOf(0x0a, start)) >= 0) {
+        this.handleStderrLine(this.stderrBytes.subarray(start, newlineAt));
+        start = newlineAt + 1;
+      }
+      // 保留未完成的尾行
+      this.stderrBytes = this.stderrBytes.subarray(start);
+      // 超长且无换行的输出（如进度条）不能让缓冲无界增长
+      if (this.stderrBytes.length > 64 * 1024) {
+        this.stderrBytes = this.stderrBytes.subarray(this.stderrBytes.length - 4096);
       }
     });
 
@@ -251,7 +249,17 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
       console.error(`[${this.name}] DEBUG: Process exited with code ${code}, signal ${signal}.`);
       console.error(`[${this.name}] DEBUG: Pending requests at exit: ${this.pendingRequests.size}`);
       globalLogManager.addLog(this.name, 'error', `Process exited with code ${code}, signal ${signal}`, 'system');
-      
+
+      // 立即以「退出码 + 它最后的 stderr」拒绝所有在途请求。
+      // 此前不拒绝，它们只能各自等到 30s 超时，失败原因被记成「Request timeout」——
+      // 而子进程往往已经说出了真正的原因（例如 cmd 的「系统找不到指定的路径。」），却被淹没。
+      const exitReason = this.describeExit(code, signal);
+      for (const [id, pending] of Array.from(this.pendingRequests.entries())) {
+        this.pendingRequests.delete(id);
+        clearTimeout(pending.timeout);
+        pending.reject(new Error(exitReason));
+      }
+
       // Log crash history
       const now = Date.now();
       this.crashCount++;
@@ -294,6 +302,39 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
         globalLogManager.addLog(this.name, 'warn', noReconnectMsg, 'system');
       }
     });
+  }
+
+  /** 处理一行子进程 stderr（原始字节，已按 \n 切好） */
+  private handleStderrLine(raw: Buffer): void {
+    const stderr = decodeChildLine(raw).replace(/\r$/, '').trim();
+    if (!stderr) return;
+
+    this.rememberStderr(stderr);
+    console.error(`[${this.name}] DEBUG: STDERR content: ${stderr.substring(0, 200)}`);
+    globalLogManager.addServerOutput(this.name, stderr, 'stderr');
+    this.emit('log', { stream: 'stderr', data: stderr });
+
+    // Detect browsermcp stack overflow errors
+    if (stderr.includes('Maximum call stack size exceeded') || stderr.includes('RangeError')) {
+      console.error(`⚠️ ${this.name} detected stack overflow, will auto-restart on next request`);
+      globalLogManager.addLog(this.name, 'warn', 'Stack overflow detected, will auto-restart on next request', 'system');
+    }
+  }
+
+  /** 记住最近几行 stderr，供子进程退出时说明「它到底说了什么」 */
+  private rememberStderr(line: string): void {
+    this.recentStderr.push(line);
+    if (this.recentStderr.length > 10) this.recentStderr.shift();
+  }
+
+  /**
+   * 子进程退出时的失败原因：带退出码与它最后的 stderr。
+   * 只报「请求超时」会把最直接的证据淹掉 —— 子进程往往已经说出了真正的原因。
+   */
+  private describeExit(code: number | null, signal: string | null): string {
+    const base = `子进程已退出 (code=${code}, signal=${signal})`;
+    if (this.recentStderr.length === 0) return base;
+    return `${base}；最后的 stderr：${this.recentStderr.slice(-3).join(' | ')}`;
   }
 
   private handleStdoutData(data: string): void {
@@ -559,6 +600,9 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
     }
 
     this.buffer = '';
+    // stderr 状态必须一起清：否则上一个进程的残行会被算进下一次崩溃的失败原因里
+    this.stderrBytes = Buffer.alloc(0);
+    this.recentStderr = [];
   }
 
   // Get current tool list (fetch in real-time from server)

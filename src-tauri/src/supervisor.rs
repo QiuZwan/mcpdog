@@ -161,9 +161,37 @@ fn config_path() -> PathBuf {
     mcpdog_dir().join("mcpdog.config.json")
 }
 
+/// 去掉 Windows 扩展长度路径前缀（`\\?\` 与 `\\?\UNC\`）。
+///
+/// Tauri 的 `resource_dir()` 在 Windows 上返回带 `\\?\` 前缀的路径。该前缀在 Rust/Node 里可用，
+/// 但 **cmd.exe 不认**：壳把它前置进 daemon 的 PATH 后，cross-spawn 用 PATH 解析 `npx` 会得到
+/// `\\?\E:\...\node\npx.cmd`，cmd 执行它时报「系统找不到指定的路径。」并 exit 1 ——
+/// 于是所有 `npx`/`npm` 型子服务器都连不上（线上表现为 playwright 连不上、initialize 30s 超时）。
+///
+/// 仅在剥离后仍在 MAX_PATH 内时剥离：超长路径去掉前缀反而会失效。
+fn strip_extended_prefix(path: PathBuf) -> PathBuf {
+    const UNC_PREFIX: &str = r"\\?\UNC\";
+    const PREFIX: &str = r"\\?\";
+
+    let raw = path.to_string_lossy().to_string();
+    let stripped = if let Some(rest) = raw.strip_prefix(UNC_PREFIX) {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = raw.strip_prefix(PREFIX) {
+        rest.to_string()
+    } else {
+        return path;
+    };
+
+    if stripped.len() >= 260 {
+        // 长路径仍需要扩展前缀，原样返回
+        return path;
+    }
+    PathBuf::from(stripped)
+}
+
 fn resource_dir() -> Option<PathBuf> {
     let app = APP.lock().ok()?.clone()?;
-    app.path().resource_dir().ok()
+    app.path().resource_dir().ok().map(strip_extended_prefix)
 }
 
 fn node_exe() -> Option<PathBuf> {
@@ -927,5 +955,51 @@ mod tests {
     fn parse_pid_file_trims_whitespace_and_newlines() {
         let info = parse_pid_file("  98765 \r\n").unwrap();
         assert_eq!(info.pid, 98765);
+    }
+
+    /// 回归断言：resource_dir() 产出的路径不得带 `\\?\` 前缀，否则壳注入 PATH 后
+    /// cmd.exe 无法执行经 PATH 解析出的命令，所有 npx/npm 型子服务器都会连不上。
+    #[test]
+    fn strip_extended_prefix_removes_drive_prefix() {
+        let bs = '\\';
+        let input = format!("{bs}{bs}?{bs}E:{bs}software{bs}MCPDog{bs}node");
+        let expected = format!("E:{bs}software{bs}MCPDog{bs}node");
+        assert_eq!(
+            strip_extended_prefix(PathBuf::from(&input)),
+            PathBuf::from(expected)
+        );
+    }
+
+    #[test]
+    fn strip_extended_prefix_restores_unc_form() {
+        let bs = '\\';
+        let input = format!("{bs}{bs}?{bs}UNC{bs}server{bs}share{bs}app");
+        let expected = format!("{bs}{bs}server{bs}share{bs}app");
+        assert_eq!(
+            strip_extended_prefix(PathBuf::from(&input)),
+            PathBuf::from(expected)
+        );
+    }
+
+    #[test]
+    fn strip_extended_prefix_leaves_plain_paths_alone() {
+        let bs = '\\';
+        let plain = format!("E:{bs}software{bs}MCPDog");
+        assert_eq!(
+            strip_extended_prefix(PathBuf::from(&plain)),
+            PathBuf::from(plain)
+        );
+    }
+
+    /// 超长路径必须保留扩展前缀 —— 去掉它反而会让长路径失效。
+    #[test]
+    fn strip_extended_prefix_keeps_prefix_for_long_paths() {
+        let bs = '\\';
+        let long_rest = "a".repeat(300);
+        let input = format!("{bs}{bs}?{bs}E:{bs}{long_rest}");
+        assert_eq!(
+            strip_extended_prefix(PathBuf::from(&input)),
+            PathBuf::from(input)
+        );
     }
 }
