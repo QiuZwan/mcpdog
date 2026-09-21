@@ -15,6 +15,7 @@ import { MCPDogDaemon } from './mcpdog-daemon.js';
 import { ConfigManager } from '../config/config-manager.js';
 import { globalLogManager } from '../logging/server-log-manager.js';
 import { ServerNameValidator } from '../utils/server-name-validator.js';
+import { AdapterFactory } from '../adapters/adapter-factory.js';
 import { parseClaudeJson, buildImportPlan, ClaudeMCPEntry } from '../utils/claude-mcp-importer.js';
 import { createExpressAuthMiddleware } from '../middleware/auth.js';
 import { McpHttpEndpoint } from './mcp-http-endpoint.js';
@@ -350,10 +351,15 @@ export class DaemonWebServer {
   private setupRoutes() {
     // SPA route support - all non-API routes return index.html
     this.app.get('*', (req, res) => {
-      if (!req.path.startsWith('/api')) {
-        const indexPath = path.join(__dirname, '../../web/dist/index.html');
-        res.sendFile(indexPath);
+      // 未命中的 /api/* 必须在这里结束响应：SPA 兜底路由一旦匹配上，Express 就不再发它自己的
+      // 404，而下面的分支又不写任何东西 —— 连接会被一直挂着，客户端只能等到自己超时。
+      // （`/api` 与大小写变体同样要按 API 处理，否则 `/API/daemon` 也会挂住。）
+      const pathLower = req.path.toLowerCase();
+      if (pathLower === '/api' || pathLower.startsWith('/api/')) {
+        return res.status(404).json({ error: `Unknown API endpoint: ${req.path}` });
       }
+      const indexPath = path.join(__dirname, '../../web/dist/index.html');
+      res.sendFile(indexPath);
     });
   }
 
@@ -873,6 +879,36 @@ export class DaemonWebServer {
       }
 
       try {
+        // 先校验再落盘：addServer 只改内存，saveConfig 立刻把它写到磁盘。
+        // 若在 saveConfig 之后才抛错（例如 config.enabled 读取失败），
+        // 残缺条目已经留在配置里且接口报的是失败 —— 下次启动还会把它当启用。
+        // 故所有可能抛错的校验与读字段都放到落盘之前。
+        // 校验失败属于「请求不合法」，用 400 并带上原因（此前统一报 500）。
+        if (typeof config !== 'object' || config === null || Array.isArray(config)) {
+          return res.status(400).json({
+            error: '服务器定义无效',
+            message: '服务器定义必须是 JSON 对象'
+          });
+        }
+        if (typeof config.enabled !== 'boolean') {
+          return res.status(400).json({
+            error: '服务器定义无效',
+            message: '服务器定义缺少 enabled 布尔字段'
+          });
+        }
+
+        // 传输类型与必填字段（command/url 等）必须校验：AdapterFactory 遇到未知
+        // transport 或缺失必填字段会抛错，落盘后该服务器在下一次加载时永久失败，
+        // 成为界面上一个永远连不上的死条目，而接口此前回的是「添加成功」。
+        // 与 PUT /api/servers/:name 使用同一份校验。
+        const configErrors = AdapterFactory.validateConfig({ ...config, name } as any);
+        if (configErrors.length > 0) {
+          return res.status(400).json({
+            error: '服务器定义无效',
+            message: configErrors.join('; ')
+          });
+        }
+
         // Add the server
         configManager.addServer(name, config);
         await configManager.saveConfig();
@@ -924,6 +960,47 @@ export class DaemonWebServer {
       const serverConfig = req.body;
       const configManager = this.daemon['configManager'];
 
+      // 请求体必须是普通对象：数组会被 Object.assign 展开成 "0"/"1" 这类数字键
+      // 污染配置，标量则会让后续取值抛错。
+      if (typeof serverConfig !== 'object' || serverConfig === null || Array.isArray(serverConfig)) {
+        return res.status(400).json({ error: '服务器定义必须是 JSON 对象' });
+      }
+
+      // 存在性必须先判：否则对不存在的服务器做局部更新时，
+      // 合并结果是「只有请求体里那几个字段」，必然缺 name/transport，
+      // 于是回 400「Transport type is required」而不是应有的 404。
+      if (!configManager.getServerConfig(name)) {
+        return res.status(404).json({ error: '未找到服务器' });
+      }
+
+      // 传输类型与必填字段统一交给 AdapterFactory.validateConfig：
+      // 未知 transport 或缺失 command/url 都会让该服务器在加载时抛错，
+      // 落盘后就是一个永久不可用的死条目。
+      //
+      // 只拒绝**本次更新新引入**的问题：既有的（例如手工编辑留下的
+      // `enabled:"yes"`）不应拦住一个与之无关的局部更新 —— 否则用户改个
+      // description 都会被拒，而他并没有让配置变得更糟。
+      // 合并校验仍能抓住「切换传输但没给 url」这类由本次更新造成的新问题。
+      const existingForValidation = {
+        ...(configManager.getServerConfig(name) as any ?? {}),
+        name: (configManager.getServerConfig(name) as any)?.name || name
+      };
+      const preExistingErrors = new Set(AdapterFactory.validateConfig(existingForValidation as any));
+
+      const mergedForValidation = {
+        ...existingForValidation,
+        ...serverConfig,
+        name: serverConfig.name || existingForValidation.name || name
+      };
+      const updateErrors = AdapterFactory.validateConfig(mergedForValidation as any)
+        .filter((e) => !preExistingErrors.has(e));
+      if (updateErrors.length > 0) {
+        return res.status(400).json({
+          error: '服务器定义无效',
+          message: updateErrors.join('; ')
+        });
+      }
+
       // If name is being updated, validate the new name
       if (serverConfig.name && serverConfig.name !== name) {
         const nameValidation = ServerNameValidator.validateServerName(serverConfig.name);
@@ -947,11 +1024,35 @@ export class DaemonWebServer {
       try {
         // Get the old server config to check if it was enabled
         const oldConfig = configManager.getServerConfig(name);
-        const wasEnabled = oldConfig?.enabled || false;
+        // 不存在的服务器必须报 404：updateServer 返回 false（不抛错），此前被忽略，
+        // 更新一个不存在的服务器也会回 200「已更新」，调用方以为改动生效了。
+        if (!oldConfig) {
+          return res.status(404).json({ error: '未找到服务器' });
+        }
+        const wasEnabled = oldConfig.enabled || false;
         const nameChanged = serverConfig.name && serverConfig.name !== name;
         
         // Update the server configuration
-        configManager.updateServer(name, serverConfig);
+        // 只落盘配置字段：界面会把整个 /api/servers 对象回传（含 connected、
+        // toolCount、tools 等**运行时状态**与完整 inputSchema），不过滤就会把它们
+        // 一并写进 mcpdog.config.json（实测配置从 96B 膨胀到 1255B，且写入的是
+        // 每次都会变化的连接状态）。这些字段没有任何读者，纯属噪音与过期数据。
+        const CONFIG_FIELDS = [
+          'name', 'enabled', 'transport', 'description',
+          'command', 'args', 'cwd', 'env',
+          'endpoint', 'url', 'apiKey', 'headers', 'adminUrl',
+          'sseReconnectInterval', 'httpKeepAlive', 'sseEndpoint',
+          'maxChunkSize', 'streamTimeout', 'streamEndpoint',
+          'sessionMode', 'toolsConfig', 'timeout', 'retries', 'enabledTools',
+        ];
+        const configOnly: Record<string, any> = {};
+        for (const field of CONFIG_FIELDS) {
+          if (Object.prototype.hasOwnProperty.call(serverConfig, field)) {
+            configOnly[field] = (serverConfig as any)[field];
+          }
+        }
+
+        configManager.updateServer(name, configOnly);
         await configManager.saveConfig();
         await configManager.loadConfig();
         
@@ -1024,19 +1125,26 @@ export class DaemonWebServer {
 
       // Get the server config before removing it to check if it was enabled
       const serverConfig = configManager.getServerConfig(name);
-      const wasEnabled = serverConfig?.enabled || false;
+      // 不存在的服务器必须报 404：removeServer 返回 false（不抛错），
+      // 此前被忽略，删除一个不存在的服务器也会回 200「已删除」。
+      // 同一文件的 toggle 端点已有正确的 404 做法。
+      if (!serverConfig) {
+        return res.status(404).json({ error: '未找到服务器' });
+      }
+      const wasEnabled = serverConfig.enabled || false;
 
       await configManager.removeServer(name);
       await configManager.saveConfig();
       await configManager.loadConfig();
-      
-      // Only stop the server if it was enabled, without reloading all config
-      if (wasEnabled) {
-        console.log(`[DAEMON-WEB] Server ${name} was enabled, stopping it directly`);
-        // Use configManager's toggleServer method to stop the server
-        configManager.toggleServer(name, false);
-      } else {
-        console.log(`[DAEMON-WEB] Server ${name} was disabled, skipping stop`);
+
+      // 直接摘掉 adapter，不能依赖 toggleServer(name, false)：
+      // removeServer 已经把条目删了，toggleServer 找不到它、返回 false 且不发
+      // server-toggled 事件，于是 MCPDogServer 的 removeAdapter 永远不触发 ——
+      // 接口回「已删除」的同时该服务器仍在服务，工具照旧可列可调，要等
+      // fs.watch 的 300ms 防抖 + 重连周期才真的消失。
+      const mcpServer = this.daemon['mcpServer'];
+      if (mcpServer) {
+        mcpServer.getToolRouter().removeAdapter(name);
       }
 
       // Emit a server-removed event for the specific server
@@ -1122,9 +1230,56 @@ export class DaemonWebServer {
     try {
       const newConfig = req.body;
       const configManager = this.daemon['configManager'];
-      
+
+      // 必须校验：express.json() 对「无 body / 无 Content-Type」的请求给出 {}，
+      // 直接落盘会用空对象覆盖整个配置 —— 所有下游服务器定义一次性消失，
+      // 且接口仍回 200 成功（一个 `curl -X PUT` 即可造成）。
+      const isPlainObject = (value: unknown): value is Record<string, any> =>
+        typeof value === 'object' && value !== null && !Array.isArray(value);
+
+      if (!isPlainObject(newConfig) || !isPlainObject(newConfig.servers)) {
+        return res.status(400).json({
+          error: '配置无效',
+          message: '请求体必须是包含 servers 字段的 JSON 对象；拒绝以空或非法内容覆盖配置'
+        });
+      }
+
+      // 每个服务器条目本身也必须是对象：servers:{x:null} 会让后续所有
+      // 读取 config.servers[...].enabled 的代码抛错，daemon 进程虽活着但
+      // /api/status、/api/servers 持续 500，且该垃圾条目已落盘、重启也不会自愈。
+      for (const [serverName, serverEntry] of Object.entries(newConfig.servers)) {
+        if (!isPlainObject(serverEntry)) {
+          return res.status(400).json({
+            error: '配置无效',
+            message: `服务器 "${serverName}" 的定义必须是 JSON 对象，实际为 ${serverEntry === null ? 'null' : typeof serverEntry}`
+          });
+        }
+
+        // 与 POST/PUT servers 同一份校验：未知 transport 或缺失 command/url
+        // 的条目落盘后会在加载时抛错，成为永久连不上的死条目。
+        const entryErrors = AdapterFactory.validateConfig({
+          ...serverEntry,
+          name: (serverEntry as any).name || serverName
+        } as any);
+        if (entryErrors.length > 0) {
+          return res.status(400).json({
+            error: '配置无效',
+            message: `服务器 "${serverName}"：${entryErrors.join('; ')}`
+          });
+        }
+      }
+
+      // 顶层字段用当前配置兜底合并：这个接口的请求体通常只带 servers，
+      // 整体替换会把 version / logging / web 等段落从磁盘上抹掉
+      // （内存侧因 loadConfig 会与默认值合并而看不出异常）。
+      const mergedConfig = {
+        ...configManager.getConfig(),
+        ...newConfig,
+        servers: newConfig.servers
+      };
+
       // Update config
-      configManager['config'] = newConfig; // Directly set config
+      configManager['config'] = mergedConfig as any; // Directly set config
       await configManager.saveConfig();
       
       // Reload daemon configuration
@@ -1213,6 +1368,16 @@ export class DaemonWebServer {
       for (const item of plan.items) {
         if (item.status === 'new' && item.config) {
           try {
+            // 导入也必须过同一份校验：这条路径此前直写配置，而
+            // PUT /api/config（Web 界面的保存）会用 validateConfig 校验**整份**配置 ——
+            // 一个导入进来却过不了校验的条目，会让此后每一次保存都 400，
+            // 界面看着正常却再也存不下任何改动。
+            const importErrors = AdapterFactory.validateConfig(item.config as any);
+            if (importErrors.length > 0) {
+              skipped.push({ name: item.name, reason: `配置无效: ${importErrors.join('; ')}` });
+              continue;
+            }
+
             configManager.addServer(item.name, item.config);
             added.push({ name: item.name, transport: item.transport });
           } catch (error) {
@@ -1335,6 +1500,16 @@ export class DaemonWebServer {
       
       if (!serverConfig) {
         return res.status(404).json({ error: '未找到服务器' });
+      }
+
+      // 与 PUT /api/config 同样的防护：express.json() 对无 body 的请求给出 {}，
+      // 直接赋值会把既有的 toolsConfig（用户逐个禁用/白名单的设置）静默清空，
+      // 工具全部恢复启用，接口却回「成功」。
+      if (typeof toolsConfig !== 'object' || toolsConfig === null || Array.isArray(toolsConfig)) {
+        return res.status(400).json({
+          error: '工具配置无效',
+          message: '请求体必须包含 toolsConfig 对象；拒绝以空或非法内容覆盖既有工具配置'
+        });
       }
       
       // Update tool config

@@ -21,7 +21,10 @@ export class DaemonClient extends EventEmitter {
   private isConnected = false;
   private reconnectTimer?: NodeJS.Timeout;
   private requestCounter = 0;
-  private pendingRequests = new Map<string, (response: any) => void>();
+  private pendingRequests = new Map<string, {
+    resolve: (response: any) => void;
+    reject: (error: Error) => void;
+  }>();
   private recvBuffer = '';
 
   constructor(config: DaemonClientConfig) {
@@ -81,6 +84,12 @@ export class DaemonClient extends EventEmitter {
         console.log('[DAEMON-CLIENT] Disconnected from daemon');
       }
       this.isConnected = false;
+
+      // 连接断了，在途请求不可能再收到响应：必须显式失败。
+      // 此前只置标志位，等待方（stdio-proxy 的 await sendMCPRequest）永远挂住，
+      // MCP 客户端那边表现为毫无反馈地一直等。
+      this.failPendingRequests(new Error('Connection to daemon closed before response'));
+
       this.emit('disconnected');
       
       if (this.config.reconnect) {
@@ -116,17 +125,20 @@ export class DaemonClient extends EventEmitter {
         // MCP request response
         const responseCallback = this.pendingRequests.get(message.requestId);
         if (responseCallback) {
-          responseCallback(message.response);
           this.pendingRequests.delete(message.requestId);
+          responseCallback.resolve(message.response);
         }
         break;
 
       case 'mcp-error':
-        // MCP request error
+        // MCP request error：error 字段本身就是一条完整的 JSON-RPC 错误报文
+        // （见 daemon 侧 mcp-request 的 catch），原样交给上层即可。
+        // 此前包成 { error: message.error }，把完整报文塞进 error 里，
+        // 客户端拿到的既没有 jsonrpc/id 也没有 error.code，无法对应到自己的请求。
         const errorCallback = this.pendingRequests.get(message.requestId);
         if (errorCallback) {
-          errorCallback({ error: message.error });
           this.pendingRequests.delete(message.requestId);
+          errorCallback.resolve(message.error);
         }
         break;
 
@@ -148,6 +160,14 @@ export class DaemonClient extends EventEmitter {
         break;
 
       default:
+        // MCP 协议报文（形如 {jsonrpc:'2.0', method:'notifications/...'}）没有 `type` 字段，
+        // 它们是 daemon 转发的服务端通知，必须交给上层写回 MCP 客户端。
+        // 此前一律归为「未知消息类型」丢弃，配置热更新后的 tools/list_changed 到不了客户端。
+        if (message && message.jsonrpc === '2.0' && typeof message.method === 'string') {
+          this.emit('mcp-notification', message);
+          break;
+        }
+
         if (!this.config.silent) {
           console.warn('[DAEMON-CLIENT] Unknown message type:', message.type);
         }
@@ -164,6 +184,19 @@ export class DaemonClient extends EventEmitter {
     }
   }
 
+  /** 让所有在途请求以错误结束，避免等待方永久挂住 */
+  private failPendingRequests(error: Error): void {
+    if (this.pendingRequests.size === 0) return;
+    const pending = Array.from(this.pendingRequests.entries());
+    this.pendingRequests.clear();
+    for (const [requestId, entry] of pending) {
+      entry.reject(error);
+      if (!this.config.silent) {
+        console.error(`[DAEMON-CLIENT] Failing pending request ${requestId}: ${error.message}`);
+      }
+    }
+  }
+
   private scheduleReconnect() {
     if (this.reconnectTimer) return;
     
@@ -171,10 +204,28 @@ export class DaemonClient extends EventEmitter {
       console.log(`[DAEMON-CLIENT] Scheduling reconnect in ${this.config.reconnectInterval}ms`);
     }
     this.reconnectTimer = setTimeout(() => {
+      // 必须先清掉自己：这个字段同时是「是否有重连在排队」的判据（见上面的守卫），
+      // 回调触发后若仍留着这个已完成的 timer 对象，下一次 close 触发的
+      // scheduleReconnect() 会被守卫直接短路 —— 重连只跑一轮就再也不试，
+      // proxy 的「连续 3 次连不上就自拉起 daemon」阈值因此永远达不到。
+      this.reconnectTimer = undefined;
+
       if (!this.config.silent) {
         console.log('[DAEMON-CLIENT] Attempting to reconnect...');
       }
-      this.connect();
+      // 必须接住 rejection：connect() 在 daemon 不可达时 reject，裸调用会成为
+      // process 级 unhandledRejection，而 CLI 的 handler 是 process.exit(1) ——
+      // proxy 会因此自杀，它自己的 autoRestart 自愈路径永远走不到。
+      // 这里失败是预期情况（等下一轮重试即可），只需记录。
+      this.connect().catch((error: Error) => {
+        if (!this.config.silent) {
+          console.error(`[DAEMON-CLIENT] Reconnect attempt failed: ${error.message}`);
+        }
+        // 连接失败不会有 'connect'/'close' 事件来重新排期，必须在这里续上下一次
+        if (this.config.reconnect) {
+          this.scheduleReconnect();
+        }
+      });
     }, this.config.reconnectInterval);
   }
 
@@ -230,14 +281,23 @@ export class DaemonClient extends EventEmitter {
   disconnect() {
     this.config.reconnect = false;
     this.clearReconnectTimer();
+    // 主动断开同样要了结在途请求：socket.end() 之后不会再有响应，
+    // 等待方必须收到明确的失败而不是永久挂起
+    this.failPendingRequests(new Error('Disconnected from daemon'));
     this.socket.end();
   }
 
   // MCP protocol forwarding
   async sendMCPRequest(request: any): Promise<any> {
-    return new Promise((resolve) => {
+    // 未连接时必须立刻失败：send() 只是静默丢弃消息，若仍然登记在途请求，
+    // 调用方就会一直等到天荒地老（stdio-proxy 用 silent:true，连日志都没有）。
+    if (!this.isConnected) {
+      throw new Error('Cannot send MCP request: not connected to daemon');
+    }
+
+    return new Promise((resolve, reject) => {
       const requestId = `req_${++this.requestCounter}`;
-      this.pendingRequests.set(requestId, resolve);
+      this.pendingRequests.set(requestId, { resolve, reject });
       
       this.send({
         type: 'mcp-request',

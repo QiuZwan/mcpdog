@@ -41,6 +41,11 @@ export class AdapterFactory {
 
     // Transport type specific validation
     switch (config.transport) {
+      case undefined:
+      case null:
+        // 缺 transport 已在上面报过，这里不重复
+        break;
+
       case 'stdio':
         if (!config.command) {
           errors.push('Command is required for stdio transport');
@@ -68,14 +73,57 @@ export class AdapterFactory {
           }
         }
         break;
+
+      default:
+        // 未知 transport 必须报错：createAdapter 遇到它会抛 Unsupported transport type，
+        // 若这里放过，写配置的入口就会把一个永远加载不了的条目落盘
+        // （界面上多一个永远连不上的死服务器，而接口回的是「成功」）。
+        errors.push(
+          `Unsupported transport type: ${String(config.transport)} (expected stdio / http-sse / streamable-http)`
+        );
+        break;
+    }
+
+    // 字段类型校验：JSON 粘贴（AddServerModal 会原样展开粘贴内容）与外部工具
+    // 很容易给出类型不对的字段，而它们要到 spawn 时才炸，报出的还是
+    // `this.config.args?.join is not a function` 这类内部错误，条目已落盘成为死条目。
+    // 这里把「类型不对」在写入前挡掉。
+    if (config.args !== undefined && !Array.isArray(config.args)) {
+      errors.push(`args must be an array of strings, got ${typeof config.args}`);
+    } else if (Array.isArray(config.args) && config.args.some((a) => typeof a !== 'string')) {
+      errors.push('args must contain only strings');
+    }
+    if (config.cwd !== undefined && typeof config.cwd !== 'string') {
+      errors.push(`cwd must be a string, got ${typeof config.cwd}`);
+    }
+    if (config.env !== undefined && (typeof config.env !== 'object' || config.env === null || Array.isArray(config.env))) {
+      errors.push(`env must be an object, got ${config.env === null ? 'null' : Array.isArray(config.env) ? 'array' : typeof config.env}`);
+    }
+    if (config.enabled !== undefined && typeof config.enabled !== 'boolean') {
+      errors.push(`enabled must be a boolean, got ${typeof config.enabled}`);
+    }
+    // NaN 必须显式拒绝：typeof NaN === 'number'，而 NaN <= 0 / NaN < 0 都是 false，
+    // 只查类型与范围会把它整个漏过去。CLI 的 parseInt('abc') 就产生 NaN，
+    // JSON.stringify 再把它写成 null —— 落盘后 PUT /api/config 会永远 400。
+    if (config.timeout !== undefined && (typeof config.timeout !== 'number' || Number.isNaN(config.timeout))) {
+      errors.push(`timeout must be a finite number, got ${Number.isNaN(config.timeout as number) ? 'NaN' : typeof config.timeout}`);
+    }
+    if (config.retries !== undefined && (typeof config.retries !== 'number' || Number.isNaN(config.retries))) {
+      errors.push(`retries must be a finite number, got ${Number.isNaN(config.retries as number) ? 'NaN' : typeof config.retries}`);
+    }
+    if (
+      config.toolsConfig !== undefined &&
+      (typeof config.toolsConfig !== 'object' || config.toolsConfig === null || Array.isArray(config.toolsConfig))
+    ) {
+      errors.push(`toolsConfig must be an object, got ${config.toolsConfig === null ? 'null' : Array.isArray(config.toolsConfig) ? 'array' : typeof config.toolsConfig}`);
     }
 
     // Timeout config validation
-    if (config.timeout && config.timeout <= 0) {
+    if (typeof config.timeout === 'number' && !Number.isNaN(config.timeout) && config.timeout <= 0) {
       errors.push('Timeout must be a positive number');
     }
 
-    if (config.retries && config.retries < 0) {
+    if (typeof config.retries === 'number' && !Number.isNaN(config.retries) && config.retries < 0) {
       errors.push('Retries must be a non-negative number');
     }
 
@@ -93,14 +141,19 @@ export class AdapterFactory {
     }
 
     for (const [key, value] of Object.entries(env)) {
-      // Validate environment variable name format
-      if (!this.isValidEnvVarName(key)) {
-        errors.push(`Invalid environment variable name: '${key}'. Names must start with a letter or underscore and contain only letters, numbers, and underscores.`);
+      // 名称判据必须与 Node 的 spawn 实际约束一致：只禁止含 '=' 或 NUL 的名称。
+      // 此前要求「字母/下划线开头、仅字母数字下划线」，会把 Node 完全接受的
+      // 名称（如 `my.var`）判为非法 —— 于是从一个合法 Claude 配置导入的条目
+      // 过不了自己的校验，进而让整份配置在 PUT /api/config 处被拒（界面从此存不了盘）。
+      if (key.includes('=') || key.includes('\0')) {
+        errors.push(`Invalid environment variable name: '${key}' (must not contain '=' or NUL)`);
       }
 
-      // Validate environment variable value type
-      if (typeof value !== 'string') {
-        errors.push(`Environment variable '${key}' must have a string value, got ${typeof value}`);
+      // 值类型：Node 会把非字符串强制转换（实测 env:{PORT:3000} 子进程读到 "3000"），
+      // 故 number/boolean 也应接受，只有对象/数组/函数这类无法有意义转换的才拒绝。
+      const t = typeof value;
+      if (value === null || (t !== 'string' && t !== 'number' && t !== 'boolean')) {
+        errors.push(`Environment variable '${key}' must be a string (or number/boolean), got ${value === null ? 'null' : t}`);
       }
 
       // Check for empty values
@@ -109,7 +162,7 @@ export class AdapterFactory {
       }
 
       // Security check: warn about sensitive information (now only log warnings, do not block config)
-      const warnings = this.checkSensitiveEnvVar(key, value);
+      const warnings = this.checkSensitiveEnvVar(key, value as string);
       if (warnings.length > 0) {
         // Output security warnings to console, but do not treat as validation errors
         warnings.forEach(warning => {
@@ -129,14 +182,6 @@ export class AdapterFactory {
     }
 
     return errors;
-  }
-
-  /**
-   * Check if environment variable name conforms to specification
-   */
-  static isValidEnvVarName(name: string): boolean {
-    // Environment variable names should start with a letter or underscore, and contain only letters, numbers, and underscores
-    return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name);
   }
 
   /**

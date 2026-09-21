@@ -191,7 +191,12 @@ export class MCPDogServer extends EventEmitter {
       
       // Disconnect all adapters
       await this.toolRouter.disconnectAll();
-      
+
+      // 必须把 adapter 从路由里移除，否则 stop() 后再次 start() 会在
+      // createAndAddAdapter → addAdapter 处抛 "Adapter ... already exists"，
+      // 新配置的 adapter 对象被丢弃，只有旧实例被复用 —— 停机期间改过的连接参数不生效。
+      this.toolRouter.removeAllAdapters();
+
       // Cleanup
       this.isInitialized = false;
       this.isStarted = false; // 重置防重入标记，保证 stop() 后可以再次 start()
@@ -484,6 +489,8 @@ export class MCPDogServer extends EventEmitter {
     
     // Record current client capabilities, but do not overwrite previous ones (supports multiple clients)
     const clientCapabilities = {
+      // MCP 的 ClientCapabilities 没有 `notifications` 字段；这里保留该字段仅作为
+      // 历史信息展示（恒 false），通知是否发送不再依据它（见 notifyToolsChanged）
       supportsNotifications: params.capabilities?.notifications !== undefined,
       clientName: params.clientInfo?.name || 'unknown',
       clientVersion: params.clientInfo?.version || 'unknown'
@@ -658,7 +665,14 @@ export class MCPDogServer extends EventEmitter {
   }
 
   private async notifyToolsChanged(): Promise<void> {
-    if (!this.isInitialized || !this.clientCapabilities?.supportsNotifications) {
+    // 只要求已 initialize。
+    //
+    // 此前还要求 clientCapabilities.supportsNotifications，而它是按
+    // `params.capabilities?.notifications !== undefined` 算出来的 —— MCP 的
+    // ClientCapabilities 里根本没有 `notifications` 字段（通知是即发即忘的，
+    // 客户端无需声明愿意接收），所以该值恒为 false 且被首个客户端锁死：
+    // 明明在 initialize 响应里宣告了 tools.listChanged，实际永远不发。
+    if (!this.isInitialized) {
       return;
     }
 

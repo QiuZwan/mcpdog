@@ -101,14 +101,34 @@ export class StdioProxy {
     this.daemonClient.on('routes-updated', (data) => {
       // Tool routes updated, may need to send notifications
     });
+
+    // 服务端发起的 MCP 通知（如 notifications/tools/list_changed）必须原样写回客户端 stdout。
+    // 之前这里没有任何监听，daemon 就算发出来也会止步于代理进程。
+    this.daemonClient.on('mcp-notification', (notification: any) => {
+      this.sendStdioResponse(notification);
+    });
   }
 
   private async handleStdioInput(line: string) {
     if (!line) return;
 
+    let request: any;
     try {
-      const request = JSON.parse(line);
-      
+      request = JSON.parse(line);
+    } catch {
+      // 只有真正的解析失败才是 Parse error；不能把下游转发失败也算成它
+      this.sendStdioResponse({
+        jsonrpc: "2.0",
+        id: null,
+        error: {
+          code: -32700,
+          message: "Parse error"
+        }
+      });
+      return;
+    }
+
+    try {
       // Check if it's a notification message (no id field)
       if (!('id' in request)) {
         // Notification messages are temporarily ignored or forwarded to daemon
@@ -141,23 +161,17 @@ export class StdioProxy {
       this.sendStdioResponse(response);
       
     } catch (error) {
-      // Don't output error logs to stderr to avoid polluting MCP protocol
-              // Send standard JSON-RPC error response
-      try {
-        const request = JSON.parse(line);
-        if ('id' in request) {
-          this.sendStdioResponse({
-            jsonrpc: "2.0",
-            id: request.id,
-            error: {
-              code: -32700,
-              message: "Parse error"
-            }
-          });
+      // 转发失败（daemon 断开、请求在途时连接关闭等）：必须回一条 JSON-RPC 错误，
+      // 否则客户端在等一个永远不会来的响应。此前这里统一回 "Parse error"，
+      // 把连接问题误报成报文格式问题，排查方向被带偏。
+      this.sendStdioResponse({
+        jsonrpc: "2.0",
+        id: request?.id ?? null,
+        error: {
+          code: -32603,
+          message: `Internal error: ${(error as Error).message}`
         }
-      } catch {
-        // Unable to parse request, ignore
-      }
+      });
     }
   }
 

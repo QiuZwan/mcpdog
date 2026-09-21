@@ -5,6 +5,7 @@ import {
   buildImportPlan,
   ClaudeMCPEntry,
 } from './claude-mcp-importer';
+import { AdapterFactory } from '../adapters/adapter-factory.js';
 
 describe('parseClaudeJson', () => {
   it('should extract top-level mcpServers', () => {
@@ -151,6 +152,34 @@ describe('buildImportPlan', () => {
     expect(plan.counts.new).toBe(2); // good-stdio, good-remote
     expect(plan.counts.conflict).toBe(1); // already-here
     expect(plan.counts.invalid).toBe(2); // bad name!, broken
+  });
+
+  it('导入产物必须能通过写入侧的校验（否则界面保存按钮会永久失败）', () => {
+    // 真实缺陷：导入路径此前直写配置，而 PUT /api/config（界面保存）会用
+    // AdapterFactory.validateConfig 校验**整份**配置 —— 一个导入进来却过不了校验的
+    // 条目会让此后每一次保存都 400，界面看着正常却再也存不下任何改动。
+    // Claude 配置里数字/布尔 env 很常见（{"PORT":3000}），必须能被接受（Node 也会强制转换）。
+    const plan = buildImportPlan({
+      source: 'any',
+      entries: {
+        // 故意用非字符串值：真实 Claude 配置里很常见，而类型声明是 string
+        num_env: { command: 'node', env: { PORT: 3000, DEBUG: true } as any },
+        dotted_env: { command: 'node', env: { 'my.var': 'x' } },
+      },
+      existingNames: [],
+      validateName: testValidator,
+    });
+
+    for (const item of plan.items) {
+      expect(item.status, `${item.name} 应被判定为可导入`).toBe('new');
+      const errors = AdapterFactory.validateConfig(item.config as any);
+      expect(errors, `${item.name} 的导入产物必须能通过 validateConfig：${errors.join('; ')}`).toEqual([]);
+    }
+
+    // env 值应归一为字符串，保持与 MCPServerConfig.env 的类型声明一致
+    const numEnv = plan.items.find((i) => i.name === 'num_env')!.config!.env!;
+    expect(numEnv.PORT).toBe('3000');
+    expect(numEnv.DEBUG).toBe('true');
   });
 
   it('should defer reserved-name rejection to the validator', () => {

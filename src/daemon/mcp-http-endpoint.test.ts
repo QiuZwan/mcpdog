@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { createServer, Server as HttpServer } from 'http';
 import type { AddressInfo } from 'net';
+import { getFetchSafePort } from '../utils/test-safe-port.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { McpHttpEndpoint } from './mcp-http-endpoint.js';
 
@@ -22,8 +23,10 @@ async function startEndpoint(overrides: Partial<any> = {}) {
   const http: HttpServer = createServer((req, res) => {
     void endpoint.handleRequest(req, res);
   });
-  await new Promise<void>((r) => http.listen(0, '127.0.0.1', () => r()));
-  const port = (http.address() as AddressInfo).port;
+  // 显式取 fetch 可用端口：listen(0) 可能落到 WHATWG 阻止端口，
+  // 而 Node 的 fetch 会直接以 bad port 失败（端口本身可绑定）→ 测试随机挂
+  const port = await getFetchSafePort();
+  await new Promise<void>((r) => http.listen(port, '127.0.0.1', () => r()));
   return {
     endpoint,
     url: `http://127.0.0.1:${port}/mcp`,

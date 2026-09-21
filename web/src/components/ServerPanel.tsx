@@ -191,7 +191,10 @@ export const ServerPanel: React.FC<ServerPanelProps> = ({ server, refreshServerT
           cleanedEnv[key] = String(value);
         }
       });
-      cleanedConfig.env = Object.keys(cleanedEnv).length > 0 ? cleanedEnv : undefined;
+      // 空对象而不是 undefined：undefined 会被 JSON.stringify 丢掉键，
+      // 服务端按「合并」处理时就会保留旧值 —— 表现为「删掉最后一个环境变量并保存」
+      // 回了成功却什么都没改。显式空对象才能真正清空。
+      cleanedConfig.env = cleanedEnv;
     }
     
     try {
@@ -257,8 +260,11 @@ export const ServerPanel: React.FC<ServerPanelProps> = ({ server, refreshServerT
 
   // Validate environment variable name
   const isValidEnvVarName = (name: string): boolean => {
-    // Environment variable names should start with a letter or underscore, containing only letters, numbers, and underscores
-    return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name);
+    // 判据必须与后端 AdapterFactory.validateEnvironmentVariables 一致：
+    // Node 的 spawn 只要求名称不含 '=' 与 NUL，含点号等字符完全合法。
+    // 界面若比后端更严，用户从 Claude 配置导入（或手工添加）一个带点号的名称后
+    // 会存不了盘 —— 保存被这个校验直接挡回，而后端其实是接受的。
+    return name.length > 0 && !name.includes('=') && !name.includes('\0');
   };
 
   const addEnvVar = () => {
@@ -336,7 +342,8 @@ export const ServerPanel: React.FC<ServerPanelProps> = ({ server, refreshServerT
     if (keyToRemove) {
       const newHeaders = { ...currentHeaders };
       delete newHeaders[keyToRemove];
-      setEditedConfig({ ...editedConfig, headers: Object.keys(newHeaders).length > 0 ? newHeaders : undefined });
+      // 同上：undefined 会被 JSON 丢掉，服务端合并后旧 header 仍在（假成功）
+      setEditedConfig({ ...editedConfig, headers: newHeaders });
     }
   };
 
@@ -728,7 +735,13 @@ export const ServerPanel: React.FC<ServerPanelProps> = ({ server, refreshServerT
                       <input
                         type="number"
                         value={editedConfig.timeout || ''}
-                        onChange={(e) => handleInputChange('timeout', e.target.value ? parseInt(e.target.value) : undefined)}
+                        onChange={(e) => {
+                          // 空值写回默认值而不是 undefined：undefined 会被
+                          // JSON.stringify 丢掉，服务端按合并处理时保留旧值 ——
+                          // 表现为「清空超时并保存」回了成功却什么都没改。
+                          const n = parseInt(e.target.value, 10);
+                          handleInputChange('timeout', Number.isNaN(n) ? 30000 : n);
+                        }}
                         disabled={!isEditing}
                         className="input input-bordered w-full"
                         placeholder="30000"
@@ -741,7 +754,11 @@ export const ServerPanel: React.FC<ServerPanelProps> = ({ server, refreshServerT
                       <input
                         type="number"
                         value={editedConfig.retries || ''}
-                        onChange={(e) => handleInputChange('retries', e.target.value ? parseInt(e.target.value) : undefined)}
+                        onChange={(e) => {
+                          // 同上：空值写回默认值，避免静默空操作
+                          const n = parseInt(e.target.value, 10);
+                          handleInputChange('retries', Number.isNaN(n) ? 3 : n);
+                        }}
                         disabled={!isEditing}
                         className="input input-bordered w-full"
                         placeholder="3"

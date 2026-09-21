@@ -8,6 +8,8 @@ import { DaemonCommands } from './daemon-commands.js';
 import { spawn } from 'child_process';
 import { DaemonClient } from '../../daemon/daemon-client.js';
 import { MCPDogDaemon, DaemonConfig } from '../../daemon/mcpdog-daemon.js';
+import { parsePidFileContent, looksLikeOurDaemon } from '../../utils/pid-file.js';
+import { readProcessCommandLine } from './daemon-commands.js';
 import { createServer } from 'net';
 import fs from 'fs/promises';
 import path from 'path';
@@ -188,7 +190,9 @@ ${CLIUtils.colorize('[INFO]', 'cyan')} Daemon is running in the background
   private async isPortAvailable(port: number): Promise<boolean> {
     return new Promise((resolve) => {
       const server = createServer();
-      server.listen(port, 'localhost', () => {
+      // 与 dashboard 实际绑定地址一致（见 daemon-web-server 监听 127.0.0.1）：
+      // 'localhost' 会先解析到 ::1，把已占用的 127.0.0.1 端口误报为可用
+      server.listen(port, '127.0.0.1', () => {
         server.close();
         resolve(true);
       });
@@ -227,14 +231,39 @@ ${CLIUtils.colorize('Need help?', 'cyan')}
   }
 
   private async isDaemonRunning(options: Record<string, any>): Promise<boolean> {
-    const pidFile = options['pid-file'] || path.join(process.cwd(), 'mcpdog.pid');
+    // 必须与 daemon 实际写入的文件一致：daemon 用 options['pid-file'] 或
+    // ~/.mcpdog/mcpdog.pid（见 parseStartupOptions），此前这里却按 cwd 找，
+    // 于是这个「已在运行」守卫从未命中。
+    const pidFile = options['pid-file'] || path.join(os.homedir(), '.mcpdog', 'mcpdog.pid');
     try {
       const pidData = await fs.readFile(pidFile, 'utf-8');
-      const pid = parseInt(pidData.trim());
-      
+      // 文件内容是新格式 {"pid":N,"version":"x"}，必须走共享解析器：
+      // 直接 parseInt 会得到 NaN，process.kill(NaN,0) 抛 ERR_INVALID_ARG_TYPE 被吞掉，
+      // 判定同样形同虚设。
+      const info = parsePidFileContent(pidData);
+      if (!info) return false;
+
       // 检查进程是否存在
-      process.kill(pid, 0);
-      return true;
+      process.kill(info.pid, 0);
+
+      // 光「PID 活着」不够：非正常终止不会清理 PID 文件，重启后该 PID 很容易被
+      // 别的程序复用。不校验身份就会把无关进程当成自己的 daemon —— 轻则永久拒绝
+      // 启动（用户再也起不来 daemon），重则调用方据此去终止那个无关进程。
+      // 读不到命令行时按「不能认定它在运行」处理（shared helper 的契约）。
+      const commandLine = await readProcessCommandLine(info.pid);
+      if (looksLikeOurDaemon(commandLine)) {
+        return true;
+      }
+
+      CLIUtils.warn(
+        `PID 文件陈旧：PID ${info.pid} 不是 MCPDog daemon，忽略该记录`
+      );
+      try {
+        await fs.unlink(pidFile);
+      } catch {
+        // 文件可能已被清理，忽略
+      }
+      return false;
     } catch {
       return false;
     }

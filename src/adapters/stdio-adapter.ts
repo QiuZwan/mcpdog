@@ -1,5 +1,5 @@
 import spawn from 'cross-spawn';
-import { ChildProcess } from 'child_process';
+import { ChildProcess, execFile } from 'child_process';
 import { EventEmitter } from 'events';
 import { MCPServerConfig, MCPTool, MCPRequest, MCPResponse, ServerAdapter } from '../types/index.js';
 import { globalLogManager } from '../logging/server-log-manager.js';
@@ -28,6 +28,10 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
   private crashCount: number = 0;
   private lastCrashTime: number = 0;
   private isRecovering: boolean = false;
+  /** 待执行的自动恢复定时器；必须可取消，否则 disconnect() 后进程仍会被重新拉起 */
+  private recoveryTimer?: NodeJS.Timeout;
+  /** 是否已放弃恢复（disconnect 时置位）；attemptRecovery 在等待结束后据此退出 */
+  private recoveryAborted = false;
   private crashHistory: number[] = []; // Crash time history
   private isBlacklisted: boolean = false; // Whether blacklisted
   private blacklistUntil: number = 0; // Blacklist release time
@@ -73,10 +77,24 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
       throw new Error(`Adapter ${this.name} is disabled.`);
     }
 
+    // 显式重新连接（含 enable 后重连）视为恢复意图，清除上一次断开留下的放弃标记
+    this.recoveryAborted = false;
+
     if (this.isBlacklisted) {
-      const remaining = Math.ceil((this.blacklistUntil - Date.now()) / 1000);
-      console.error(`[${this.name}] Adapter is blacklisted for ${remaining}s, skipping connect() call.`);
-      throw new Error(`Adapter ${this.name} is blacklisted.`);
+      // 先让黑名单有机会过期。checkAndUpdateBlacklist 只在进程退出时被调用，
+      // 而黑名单生效期间 connect() 直接抛错、不会有新的退出事件 —— 于是过期判断
+      // 永远不会被重新求值，一次拉黑就是整个进程生命周期内永久不可连。
+      // 这里在每次连接尝试前复核一次，让「拉黑 N 分钟」真正只是 N 分钟。
+      if (Date.now() >= this.blacklistUntil) {
+        console.error(`🟢 ${this.name} blacklist expired, allowing reconnection`);
+        this.isBlacklisted = false;
+        this.blacklistUntil = 0;
+        this.crashCount = Math.max(0, this.crashCount - 2);
+      } else {
+        const remaining = Math.ceil((this.blacklistUntil - Date.now()) / 1000);
+        console.error(`[${this.name}] Adapter is blacklisted for ${remaining}s, skipping connect() call.`);
+        throw new Error(`Adapter ${this.name} is blacklisted.`);
+      }
     }
 
     if (!this.config.command) {
@@ -171,7 +189,11 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
   }
 
   async disconnect(): Promise<void> {
-    if (!this.isConnected) {
+    // 不能因 !isConnected 就早退：进程退出后、退避重连触发前，
+    // isConnected 已是 false，但待执行的恢复定时器仍在，子进程也随时会被重新拉起。
+    // 早退会让 disconnect() 什么都没做，随后 attemptRecovery 复活该服务器
+    // —— disconnectAll()（MCPDogServer.stop 之外的入口）单独调用时会出现这种情况。
+    if (!this.isConnected && !this.process && !this.recoveryTimer && !this.isRecovering) {
       console.error(`[${this.name}] Already disconnected, skipping disconnect() call.`);
       globalLogManager.addLog(this.name, 'warn', 'Disconnect called but server already disconnected', 'system');
       return;
@@ -187,6 +209,12 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
     }
     this.pendingRequests.clear();
 
+    // 取消待执行的自动恢复，使「已停止」成为稳定状态。
+    // 同时置位放弃标记：已经进入 attemptRecovery 且正在等待的那一次也要退出，
+    // 否则它会在 1s 等待结束后把子进程重新拉起来。
+    this.recoveryAborted = true;
+    this.cancelRecovery();
+
     this.cleanup();
     this.isConnected = false;
     
@@ -194,6 +222,14 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
     globalLogManager.updateConnectionStatus(this.name, false);
     globalLogManager.addLog(this.name, 'info', 'MCP server disconnected successfully', 'system');
     this.emit('disconnected', { serverName: this.name });
+  }
+
+  /** 取消待执行的自动恢复，使「已停止」成为稳定状态 */
+  private cancelRecovery(): void {
+    if (this.recoveryTimer) {
+      clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = undefined;
+    }
   }
 
   private setupProcessHandlers(): void {
@@ -245,6 +281,8 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
       this.emit('error', { error, context: `${this.name}-process` });
     });
 
+    // 捕获注册时的进程引用：下面用它判断这个 exit 是否属于「当前这个进程」
+    const proc = this.process;
     this.process.on('exit', (code: number | null, signal: string | null) => {
       console.error(`[${this.name}] DEBUG: Process exited with code ${code}, signal ${signal}.`);
       console.error(`[${this.name}] DEBUG: Pending requests at exit: ${this.pendingRequests.size}`);
@@ -258,6 +296,18 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
         this.pendingRequests.delete(id);
         clearTimeout(pending.timeout);
         pending.reject(new Error(exitReason));
+      }
+
+      // 必须是「当前这个进程」的退出事件，迟到的旧进程 exit 一律忽略。
+      //
+      // cleanup() 用异步 taskkill / 延迟 SIGKILL 杀旧进程后就立刻把 this.process
+      // 置空，而 attemptRecovery 只等 1s 就拉起新进程 —— 旧进程的 exit 常常在新进程
+      // 已经 connected 之后才送达。不做校验的话，这个迟到的 exit 会把健康的新连接
+      // 标成 isConnected=false、发出 disconnected（工具从 tools/list 消失），
+      // 还会再排一轮恢复把新进程也杀掉：一次「重启该服务器」变成 3 个进程。
+      if (this.process !== proc) {
+        console.error(`[${this.name}] Ignoring exit from superseded process (pid ${proc.pid})`);
+        return;
       }
 
       // Log crash history
@@ -293,7 +343,8 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
         console.error(`[${this.name}] ${reconnectMsg}`);
         globalLogManager.addLog(this.name, 'info', reconnectMsg, 'system');
         
-        setTimeout(() => {
+        this.recoveryTimer = setTimeout(() => {
+          this.recoveryTimer = undefined;
           this.attemptRecovery();
         }, delay);
       } else {
@@ -545,9 +596,17 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
 
       try {
         const requestStr = JSON.stringify(request) + '\n';
-        console.error(`[${this.name}] DEBUG: Writing to stdin - length: ${requestStr.length}`);
-        this.process!.stdin!.write(requestStr);
-        console.error(`[${this.name}] DEBUG: Successfully wrote to stdin`);
+        this.writeToStdin(requestStr, (writeError) => {
+          // 写入失败（进程刚死，异步 EPIPE）：了结这个请求，不要把错误抛到进程级。
+          // stdin 是独立于 child_process 的 socket，它的 'error' 事件不挂监听
+          // 就会成为 uncaughtException —— 而 CLI 的 handler 是 process.exit(1)，
+          // 一个下游进程死掉会把整个 daemon 连同所有会话一起带走。
+          this.pendingRequests.delete(request.id);
+          clearTimeout(timeout);
+          const errorMsg = `Failed to write to ${this.name}: ${writeError.message}`;
+          globalLogManager.addLog(this.name, 'error', errorMsg, 'system');
+          reject(new Error(errorMsg));
+        });
       } catch (error) {
         this.pendingRequests.delete(request.id);
         clearTimeout(timeout);
@@ -558,8 +617,54 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
     });
   }
 
+  /**
+   * 向子进程 stdin 写一行，失败时回调而不是抛出。
+   *
+   * stdin.write 的错误是**异步**通过 'error' 事件到达的（EPIPE/ERR_STREAM_DESTROYED），
+   * try/catch 只能接住同步抛错。这里挂一次性监听把失败交回调用方，
+   * 避免它变成无人处理的 'error' 事件导致整个进程退出。
+   */
+  private writeToStdin(data: string, onError: (error: Error) => void): void {
+    const stdin: any = this.process?.stdin;
+    if (!stdin) {
+      onError(new Error('stdin is not available'));
+      return;
+    }
+
+    // 某些测试替身给的是只有 write 的普通对象；没有事件接口时退化为直接写
+    if (typeof stdin.once !== 'function' || typeof stdin.off !== 'function') {
+      try {
+        stdin.write(data);
+      } catch (error) {
+        onError(error as Error);
+      }
+      return;
+    }
+
+    const handleError = (error: Error) => {
+      stdin.off('error', handleError);
+      onError(error);
+    };
+    stdin.once('error', handleError);
+
+    try {
+      stdin.write(data, () => {
+        // 写入成功：摘掉监听，避免长期累积
+        stdin.off('error', handleError);
+      });
+    } catch (error) {
+      stdin.off('error', handleError);
+      onError(error as Error);
+    }
+  }
+
   private sendNotification(notification: any): void {
-    if (!this.isConnected || !this.process?.stdin) {
+    // 判据用「子进程是否真的可写」而不是 isConnected：握手期的
+    // notifications/initialized 必须在 isConnected 置位**之前**发出
+    // （initialize() 在 doConnect() 里、isConnected = true 之前调用它），
+    // 用 isConnected 判断会把这条通知静默丢掉，下游等不到 initialized。
+    // 这与两个 HTTP 适配器的处理保持一致。
+    if (!this.process?.stdin || this.process.killed || this.process.exitCode !== null) {
       return;
     }
 
@@ -582,7 +687,18 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
     const target = this.process;
     if (target) {
       try {
-        if (!target.killed) {
+        if (process.platform === 'win32' && target.pid) {
+          // Windows 上必须按「进程树」杀。
+          // 全局安装的 npx/npm 型子服务器经 cmd.exe shim 启动，this.process 是 cmd.exe，
+          // 真正的 MCP 服务进程是它的子进程 —— 只 kill cmd.exe 会把子进程留成孤儿
+          // （实测 shim 已死、node 子进程在 1s/3s/6s 后仍在运行）。
+          // taskkill 不带 /T 同样只杀一个进程，故这里必须带 /T。
+          execFile('taskkill', ['/T', '/F', '/PID', String(target.pid)], (error) => {
+            if (error) {
+              console.error(`Failed to taskkill process tree for ${this.name}:`, error.message);
+            }
+          });
+        } else if (!target.killed) {
           target.kill('SIGTERM');
         }
 
@@ -783,7 +899,15 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
       
       // Wait a bit for system resources to be released
       await new Promise(resolve => setTimeout(resolve, 1000));
-      
+
+      // 等待期间可能已被 disconnect()（停机）或 disable()（移除适配器）：
+      // 这时必须放弃本次恢复，否则会在断开之后把子进程重新拉起来，
+      // 「已停止」就不再是稳定状态（子进程与事件监听都成了孤儿）。
+      if (this.isDisabled || this.recoveryAborted) {
+        console.error(`🚫 ${this.name} recovery aborted (disabled or disconnected)`);
+        return;
+      }
+
       // Try to reconnect
       await this.connect();
       
@@ -806,6 +930,11 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
     console.error(`🔄 Force reconnecting ${this.name}...`);
     this.crashCount = 0; // Reset counter
     await this.disconnect();
+    // disconnect() 会置位 recoveryAborted（那是为了阻止「停机后又被自动恢复拉起来」），
+    // 但本方法的语义是「主动重连」，必须清掉它，否则 attemptRecovery 会在
+    // `if (this.isDisabled || this.recoveryAborted) return` 处直接放弃 ——
+    // forceReconnect 变成静默空操作，进程不会被重新拉起。
+    this.recoveryAborted = false;
     await this.attemptRecovery();
   }
 

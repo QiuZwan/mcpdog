@@ -71,7 +71,15 @@ export class CLIUtils {
   }
 
   static error(message: string, ...args: any[]) {
-    if (this.env.json) return;
+    if (this.env.json) {
+      // JSON 模式下也要把失败说出来：此前直接 return，配合各命令的
+      // process.exit(1)，机器消费者拿到的是「退出码 1 + stdout 空 + stderr 空」，
+      // 完全不知道哪里失败了（config add 已按 {success:false,...} 的形态输出，
+      // 其余子命令缺失，这里补齐为同一契约）。
+      const detail = args.length > 0 ? ` ${args.map((a) => String(a)).join(' ')}` : '';
+      console.log(JSON.stringify({ success: false, error: `${message}${detail}` }, null, 2));
+      return;
+    }
     console.error(this.colorize('❌', 'red'), message, ...args);
   }
 

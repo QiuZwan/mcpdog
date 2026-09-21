@@ -69,12 +69,34 @@ export class McpHttpEndpoint {
       }
       entry.lastActivity = Date.now();
       if (method === 'DELETE') {
-        // 先让 transport 自己回应并触发 onsessionclosed，再兜底移除
+        // SDK 在校验失败时会在**关闭 transport 之前**就返回 —— 且是正常的 `return`，
+        // 不抛异常（见 SDK 的 handleDeleteRequest：validateSession/validateProtocolVersion
+        // 失败即 return），所以既不能用异常判断，也不能无条件删条目。
+        // 此前用 finally 无条件删除：这一删，transport 与它持有的 SSE 流就再没人能碰到 ——
+        // 不在 sessions 里，reapIdleSessions 与 close() 都够不着，流一直开着，
+        // http.close() 的回调永不触发，`daemon stop()` 于是挂住只能强杀。
+        // 判据改为「SDK 是否真的关掉了它」：正常路径由 SDK 调 close()（会 end 掉所有 SSE 响应），
+        // 故用 transport 的 onclose 标记；没关则我们兜底关掉并回收条目。
+        let sdkClosedTransport = false;
+        const originalOnClose = (entry.transport as any).onclose;
+        (entry.transport as any).onclose = () => {
+          sdkClosedTransport = true;
+          originalOnClose?.();
+        };
+
         try {
           await entry.transport.handleRequest(req, res);
+        } catch (error) {
+          console.error(`[MCP-HTTP] DELETE 会话失败: ${sessionId}`, error);
         } finally {
-          this.sessions.delete(sessionId);
+          (entry.transport as any).onclose = originalOnClose;
         }
+
+        if (!sdkClosedTransport) {
+          // 校验失败等路径没关 transport：必须兜底释放，否则 SSE 流泄漏并挂住停机
+          await entry.transport.close().catch(() => {});
+        }
+        this.sessions.delete(sessionId);
         return;
       }
       await entry.transport.handleRequest(req, res);

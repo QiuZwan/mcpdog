@@ -121,7 +121,7 @@ describe('ToolRouter', () => {
     expect(response.error?.message).toContain('Tool not found');
   });
 
-  it('should remove routes when an adapter disconnects', async () => {
+  it('should hide tools and refuse calls when an adapter disconnects', async () => {
     const mockTools: MCPTool[] = [{ name: 'tool1', description: 'desc1', inputSchema: { type: 'object' } }];
     const adapter = new MockAdapter('server1', mockTools);
 
@@ -131,10 +131,23 @@ describe('ToolRouter', () => {
     let allTools = await toolRouter.getAllTools();
     expect(allTools).toHaveLength(1);
 
+    // 掉线：工具必须从对外清单里消失，调用必须被拒。
+    //
+    // 这里不再断言 findToolRoute 返回 undefined —— 路由条目刻意保留：
+    // 路由键（是否带 serverName- 前缀）取决于「哪些服务器提供了同名工具」，
+    // 掉线就清缓存会让别的服务器同名工具在 `alpha-x` 与裸名 `x` 之间反复跳变，
+    // 客户端手里的名字在重连窗口内失效（默认退避 5s）。
+    // 对外可见性由 getAllTools（只遍历已连接 adapter）与 callTool 的
+    // 「Server not connected」共同保证。
+    adapter.isConnected = false;
     adapter.emit('disconnected');
 
-    const route = toolRouter.findToolRoute('tool1');
-    expect(route).toBeUndefined();
+    allTools = await toolRouter.getAllTools(true);
+    expect(allTools).toHaveLength(0);
+
+    const res = await toolRouter.callTool('tool1', {});
+    expect(res.error).toBeDefined();
+    expect(res.error?.message).toContain('Server not connected');
   });
 
   it('should not block fast adapters when a slow adapter is refreshed in parallel', async () => {

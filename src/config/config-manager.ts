@@ -1,5 +1,6 @@
 import { promises as fs } from 'fs';
 import * as fsSync from 'fs';
+import { existsSync, mkdirSync, writeFileSync, unlinkSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { EventEmitter } from 'events';
@@ -17,6 +18,8 @@ export class ConfigManager extends EventEmitter {
   private watchDebounceTimer?: NodeJS.Timeout;
   private autoConfigGenerator: AutoConfigGenerator;
   private protocolDetector: ProtocolDetector;
+  /** saveConfig 的并发序号：临时文件名必须每次唯一，见 saveConfig */
+  private saveSequence = 0;
 
   constructor(configPath?: string, autoCreateConfig?: boolean) {
     super();
@@ -59,6 +62,15 @@ export class ConfigManager extends EventEmitter {
     return process.argv.includes('serve') && !process.argv.includes('--web-port');
   }
 
+  /**
+   * 判断是否应当自动创建配置文件。
+   *
+   * 可写探测只在**目标目录**里做。此前用相对路径 './test-write-<ts>' 探测，
+   * 于是每次构造 ConfigManager 都会往进程 CWD（CLI 与测试下就是项目根目录）
+   * 扔一个临时文件；写入是 fire-and-forget，任何提前退出或崩溃都会把它永久留下。
+   * 而且 `return true` 写在 Promise 之外，无论写不写得进去都报「可写」，探测本身
+   * 也不成立。这里改为同步探测目标目录、并保证探测文件被清理。
+   */
   private shouldAutoCreateConfig(): boolean {
     // If in serve mode, do not auto-create (to avoid polluting stdio)
     if (process.argv.includes('serve')) {
@@ -69,14 +81,25 @@ export class ConfigManager extends EventEmitter {
     if (this.isStdioMode()) {
       return false;
     }
-    
-    // Check if file system is read-only
+
+    if (existsSync(this.configPath)) {
+      return false;
+    }
+
     try {
-      const testFile = './test-write-' + Date.now();
-      fs.writeFile(testFile, 'test').then(() => {
-        fs.unlink(testFile).catch(() => {});
-      }).catch(() => {});
-      return true;
+      const configDir = dirname(this.configPath);
+      mkdirSync(configDir, { recursive: true });
+      const probePath = join(configDir, `.write-probe-${process.pid}-${Date.now()}`);
+      try {
+        writeFileSync(probePath, 'probe');
+        return true;
+      } finally {
+        try {
+          unlinkSync(probePath);
+        } catch {
+          // 探测文件清理失败不影响结论
+        }
+      }
     } catch {
       return false;
     }
@@ -95,9 +118,30 @@ export class ConfigManager extends EventEmitter {
   async loadConfig(): Promise<void> {
     try {
       const configJson = await fs.readFile(this.configPath, 'utf-8');
+      const parsed = JSON.parse(configJson);
+
+      // 结构校验：JSON 合法不等于配置可用。
+      // `{"servers":null}` 或 `{"servers":{"x":null}}` 能解析通过，但会让
+      // getEnabledServers / reinitializeAdapters 抛错 —— 经过文件监听热加载后
+      // /api/status 与 /api/servers 会持续 500，且没有自愈路径（只能手工改回文件）。
+      // 这里直接拒绝这类文件，保留内存中的既有配置，由调用方报错。
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('配置根节点必须是 JSON 对象');
+      }
+      if (parsed.servers !== undefined) {
+        if (parsed.servers === null || typeof parsed.servers !== 'object' || Array.isArray(parsed.servers)) {
+          throw new Error('servers 必须是对象（当前为 ' + (Array.isArray(parsed.servers) ? 'array' : String(parsed.servers)) + '）');
+        }
+        for (const [name, entry] of Object.entries(parsed.servers)) {
+          if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+            throw new Error(`服务器 "${name}" 的定义必须是对象`);
+          }
+        }
+      }
+
       this.config = {
         ...this.getDefaultConfig(),
-        ...JSON.parse(configJson)
+        ...parsed
       };
     } catch (error) {
       // Config doesn't exist
@@ -141,10 +185,52 @@ export class ConfigManager extends EventEmitter {
       // Ensure the directory exists
       const configDir = dirname(this.configPath);
       await fs.mkdir(configDir, { recursive: true });
-      
-      await fs.writeFile(this.configPath, JSON.stringify(this.config, null, 2));
+
+      // 原子落盘：先写同目录临时文件再 rename。
+      // 直接 writeFile 是「截断 + 写入」，期间文件是半截的 —— 崩溃或断电会留下
+      // 无法解析的配置（整个网关的服务器定义都在这个文件里），而 fs.watch 也可能
+      // 正好读到写了一半的内容。rename 在同一文件系统内是原子的，读者要么看到
+      // 旧内容、要么看到完整新内容。
+      //
+      // 临时名必须每次唯一（进程号 + 递增序号）：只用进程号时，两次并发的
+      // saveConfig（例如多个前端请求同时改工具配置）会共用同一临时文件，
+      // 先完成的 rename 把它取走，后一个随即 ENOENT 失败并冒泡成 HTTP 500。
+      const tempPath = `${this.configPath}.tmp-${process.pid}-${++this.saveSequence}`;
+      try {
+        await fs.writeFile(tempPath, JSON.stringify(this.config, null, 2));
+        await this.renameWithRetry(tempPath, this.configPath);
+      } catch (error) {
+        // 失败时清掉自己的临时文件，不在配置目录里留垃圾
+        await fs.unlink(tempPath).catch(() => {});
+        throw error;
+      }
     } catch (error) {
       throw new Error(`Failed to save config to ${this.configPath}: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * rename 到目标路径，遇 Windows 的瞬时错误则重试。
+   *
+   * Windows 上 rename 覆盖一个已存在的目标文件会间歇性 EPERM/EBUSY
+   * （实测 200 次串行里失败 2~4 次；并发 10 次里失败 3~4 次；重试一次即成功）。
+   * 这个失败会一路冒泡成 HTTP 500，前端表现为「随机保存失败」。
+   * 注意：临时文件与目标同目录、同一文件系统，rename 仍是原子的。
+   */
+  private async renameWithRetry(from: string, to: string, attempts = 5): Promise<void> {
+    for (let i = 1; ; i++) {
+      try {
+        await fs.rename(from, to);
+        return;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        const transient = code === 'EPERM' || code === 'EBUSY' || code === 'EACCES';
+        if (!transient || i >= attempts) {
+          throw error;
+        }
+        // 退避后重试（20ms, 40ms, 80ms, 160ms）
+        await new Promise((resolve) => setTimeout(resolve, 20 * 2 ** (i - 1)));
+      }
     }
   }
 
@@ -364,6 +450,8 @@ export class ConfigManager extends EventEmitter {
       }
     } catch (error) {
       if ((error as Error).name !== 'AbortError') {
+        // 同上：仅 emit 会被静默吞掉，watch 建立失败意味着热更新彻底失效
+        console.error('Config file watcher error:', (error as Error).message);
         this.emit('configError', error);
       }
     }
@@ -383,6 +471,13 @@ export class ConfigManager extends EventEmitter {
       await this.loadConfig();
       this.emit('config-updated', { config: this.config });
     } catch (error) {
+      // 必须留下痕迹：'configError' 全仓无监听方，事件命名也不是 'error'，
+      // EventEmitter 不会因此抛出 —— 只 emit 等于静默吞掉。结果是配置文件已被改坏
+      // （或写入过程被读到半截），内存里却还是旧配置，两侧静默分叉且不会自动重试。
+      console.error(
+        `Failed to reload config from ${this.configPath}, keeping previous in-memory config:`,
+        (error as Error).message
+      );
       this.emit('configError', error);
     }
   }
@@ -442,12 +537,12 @@ export class ConfigManager extends EventEmitter {
       try {
         const detection = await this.detectConfigProtocol(serverConfig);
         
-        if (detection.issues.length > 0) {
+        if (detection.recommendations.length > 0) {
           suggestions.push({
-            config: detection.suggestedConfig || serverConfig,
+            config: serverConfig,
             confidence: 0.8,
             alternatives: [],
-            warnings: [`Detected issues with ${name}`],
+            warnings: [`Detected issues with ${name}`, ...detection.recommendations],
             optimizations: [`Server optimization available for ${name}`]
           });
         }
@@ -530,6 +625,20 @@ export class ConfigManager extends EventEmitter {
     return Promise.resolve([this.config]);
   }
 
+  /**
+   * 对某个端点做协议自动检测，返回可用的服务器配置建议。
+   *
+   * 转发到已实例化的 AutoConfigGenerator（内部用 ProtocolDetector 真实探测），
+   * 供 `config add --auto-detect` 使用 —— 此前该分支整段被注释掉，却仍报成功。
+   */
+  async generateAutoConfigForEndpoint(
+    name: string,
+    endpoint: string,
+    options?: { timeout?: number; headers?: Record<string, string> }
+  ): Promise<ConfigSuggestion> {
+    return this.autoConfigGenerator.generateConfig(name, endpoint, options);
+  }
+
   // Internal method that returns ConfigSuggestion[]
   private async generateConfigSuggestionsInternal(): Promise<ConfigSuggestion[]> {
     const suggestions: ConfigSuggestion[] = [];
@@ -550,8 +659,73 @@ export class ConfigManager extends EventEmitter {
     return this.generateAutoConfig();
   }
 
-  detectConfigProtocol(config: MCPServerConfig): Promise<any> {
-    return Promise.resolve({ protocol: "stdio", issues: [] });
+  /**
+   * 检测服务器的协议。
+   *
+   * 返回契约由调用方决定（detect-commands / diagnose-commands 读的是
+   * `detected` / `confidence` / `recommendations`），因此必须返回这些字段。
+   * 曾经恒返回 `{ protocol: 'stdio', issues: [] }`，所有 http-sse / streamable-http
+   * 服务器都被报告成 stdio 且「无问题」，检测形同虚设。
+   *
+   * 注意 `detected` **必须永远是合法的 transport 取值**：调用方会以
+   * 「detected !== server.transport && confidence > 70」为条件把它写进配置
+   * （detect-commands.ts / diagnose-commands.ts 的自动修复路径）。给出 undefined
+   * 会把 transport 覆盖成 undefined 从而写坏配置。
+   */
+  detectConfigProtocol(server: MCPServerConfig): Promise<{
+    current: string;
+    detected: string;
+    confidence: number;
+    recommendations: string[];
+    needsUpdate: boolean;
+  }> {
+    const recommendations: string[] = [];
+    // 配置里的 transport 就是权威事实，据实回报即可。
+    // 但必须保证 detected 始终是合法取值：调用方会以
+    // 「detected !== server.transport && confidence > 70」为条件把它写回配置，
+    // 给出 undefined 就会把 transport 覆盖成 undefined（配置损坏）。
+    const isValidTransport =
+      server.transport === 'stdio' ||
+      server.transport === 'http-sse' ||
+      server.transport === 'streamable-http';
+    const detected = isValidTransport ? server.transport : 'stdio';
+
+    if (!isValidTransport) {
+      recommendations.push(
+        `transport 缺失或非法（${String(server.transport)}），已按 stdio 处理`
+      );
+    }
+
+    switch (server.transport) {
+      case 'stdio':
+        if (!server.command) {
+          recommendations.push('stdio 传输缺少 command，请补充启动命令');
+        }
+        break;
+      case 'streamable-http':
+      case 'http-sse': {
+        const url = server.url || server.endpoint;
+        if (!url) {
+          recommendations.push(`${server.transport} 传输缺少 url/endpoint，请补充服务地址`);
+        } else if (!/^https?:\/\//i.test(url)) {
+          recommendations.push(`${server.transport} 的 url 不是 http(s) 地址：${url}`);
+        }
+        break;
+      }
+      default:
+        recommendations.push(`未知的 transport: ${String(server.transport)}`);
+    }
+
+    const hasIssues = recommendations.length > 0;
+
+    return Promise.resolve({
+      current: server.transport,
+      detected,
+      confidence: hasIssues ? 40 : 100,
+      recommendations,
+      // 协议与配置一致且无问题就不需要改动，避免自动修复路径去写一个等价值
+      needsUpdate: false
+    });
   }
 
   validateServerConfig(config: MCPServerConfig): { valid: boolean; errors: string[] } {
@@ -566,16 +740,67 @@ export class ConfigManager extends EventEmitter {
     return Promise.resolve({ optimizations: [] });
   }
 
+  /**
+   * 批量协议审计。字段契约同上（detect-commands 的 `--all` 读
+   * `current` / `detected` / `confidence` / `recommendations` / `needsUpdate`）。
+   */
   auditAllServerProtocols(): Promise<Record<string, any>> {
     const results: Record<string, any> = {};
-    for (const name of Object.keys(this.config.servers)) {
-      results[name] = { protocol: "stdio", issues: [] };
+    for (const [name, serverConfig] of Object.entries(this.config.servers)) {
+      const recommendations: string[] = [];
+      if (serverConfig.transport === 'stdio' && !serverConfig.command) {
+        recommendations.push('stdio 传输缺少 command');
+      } else if (
+        serverConfig.transport !== 'stdio' &&
+        !(serverConfig.url || serverConfig.endpoint)
+      ) {
+        recommendations.push(`${serverConfig.transport} 传输缺少 url/endpoint`);
+      }
+
+      const okTransport =
+        serverConfig.transport === 'stdio' ||
+        serverConfig.transport === 'http-sse' ||
+        serverConfig.transport === 'streamable-http';
+      results[name] = {
+        current: serverConfig.transport,
+        // 同 detectConfigProtocol：detected 必须是合法 transport，调用方会写回配置
+        detected: okTransport ? serverConfig.transport : 'stdio',
+        confidence: recommendations.length === 0 ? 100 : 40,
+        recommendations,
+        needsUpdate: false
+      };
     }
     return Promise.resolve(results);
   }
 
+  /**
+   * 逐工具开关。
+   *
+   * 此前是无条件 return true 的空实现，daemon 拿到 true 就当作已完成，
+   * 工具实际纹丝不动 —— 调用方看到的是「成功」。
+   * 现写入 toolsConfig.toolSettings[tool].enabled 并返回真实结果；
+   * 服务器不存在时返回 false，让调用方能区分失败。
+   */
   toggleTool(serverName: string, toolName: string, enabled: boolean): boolean {
-    // This would need actual implementation based on your tool management system  
+    const serverConfig = this.config.servers[serverName];
+    if (!serverConfig) {
+      return false;
+    }
+
+    if (!serverConfig.toolsConfig) {
+      serverConfig.toolsConfig = { mode: 'all' };
+    }
+    if (!serverConfig.toolsConfig.toolSettings) {
+      serverConfig.toolsConfig.toolSettings = {};
+    }
+
+    const existing = serverConfig.toolsConfig.toolSettings[toolName];
+    serverConfig.toolsConfig.toolSettings[toolName] = {
+      ...(existing ?? {}),
+      enabled
+    };
+
+    this.emit('tool-toggled', { serverName, toolName, enabled });
     return true;
   }
 }

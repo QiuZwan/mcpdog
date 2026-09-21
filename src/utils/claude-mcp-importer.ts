@@ -98,7 +98,18 @@ export function convertEntryToServerConfig(name: string, entry: ClaudeMCPEntry):
       command: entry.command,
       ...(Array.isArray(entry.args) ? { args: entry.args } : {}),
       ...(entry.cwd ? { cwd: entry.cwd } : {}),
-      ...(entry.env && typeof entry.env === 'object' ? { env: entry.env } : {}),
+      // env 值统一转成字符串：Claude 配置里出现数字/布尔很常见（如 {"PORT":3000}），
+      // 而 MCPServerConfig.env 的类型是 Record<string,string>。Node 会强制转换，
+      // 但把非字符串原样写进配置会让类型声明与落盘内容不一致。
+      ...(entry.env && typeof entry.env === 'object' && !Array.isArray(entry.env)
+        ? {
+            env: Object.fromEntries(
+              Object.entries(entry.env as Record<string, unknown>)
+                .filter(([, v]) => v !== null && v !== undefined)
+                .map(([k, v]) => [k, String(v)])
+            ),
+          }
+        : {}),
     };
     return { ok: true, config, transport: 'stdio' };
   }

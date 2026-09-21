@@ -180,8 +180,11 @@ export const AddServerModal: React.FC = () => {
 
   // Validate environment variable name
   const isValidEnvVarName = (name: string): boolean => {
-    // Environment variable names should start with a letter or underscore, containing only letters, numbers, and underscores
-    return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name);
+    // 判据必须与后端 AdapterFactory.validateEnvironmentVariables 一致：
+    // Node 的 spawn 只要求名称不含 '=' 与 NUL，含点号等字符完全合法。
+    // 界面若比后端更严，用户从 Claude 配置导入（或手工添加）一个带点号的名称后
+    // 会存不了盘 —— 保存被这个校验直接挡回，而后端其实是接受的。
+    return name.length > 0 && !name.includes('=') && !name.includes('\0');
   };
 
   const addEnvVar = () => {
@@ -701,7 +704,11 @@ export const AddServerModal: React.FC = () => {
                           <input
                             type="number"
                             value={serverConfig.timeout || ''}
-                            onChange={(e) => handleConfigChange('timeout', e.target.value ? parseInt(e.target.value) : undefined)}
+                            onChange={(e) => {
+                              // 挡住 NaN：后端会拒绝非数字的 timeout（NaN 序列化成 null）
+                              const n = parseInt(e.target.value, 10);
+                              handleConfigChange('timeout', Number.isNaN(n) ? undefined : n);
+                            }}
                             className="input input-bordered w-full"
                             placeholder="30000"
                           />
@@ -713,7 +720,10 @@ export const AddServerModal: React.FC = () => {
                           <input
                             type="number"
                             value={serverConfig.retries || ''}
-                            onChange={(e) => handleConfigChange('retries', e.target.value ? parseInt(e.target.value) : undefined)}
+                            onChange={(e) => {
+                              const n = parseInt(e.target.value, 10);
+                              handleConfigChange('retries', Number.isNaN(n) ? undefined : n);
+                            }}
                             className="input input-bordered w-full"
                             placeholder="3"
                           />

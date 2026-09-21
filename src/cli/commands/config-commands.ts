@@ -5,6 +5,7 @@
 import { ConfigManager } from '../../config/config-manager.js';
 import { MCPServerConfig } from '../../types/index.js';
 import { CLIUtils } from '../cli-utils.js';
+import { AdapterFactory } from '../../adapters/adapter-factory.js';
 import { createInterface } from 'readline';
 import fs from 'fs/promises';
 
@@ -14,6 +15,24 @@ interface ValidationResult {
   status: 'pass' | 'warning' | 'error';
   message: string;
   suggestion?: string;
+}
+
+/**
+ * 解析数字型 CLI 选项，非法值直接报错退出。
+ *
+ * 必须挡住 NaN：JSON.stringify 会把 NaN 写成 null，落盘后
+ * PUT /api/config 校验整份配置时会一直 400，界面再也存不了盘。
+ */
+function parseNumericOption(raw: string | undefined, fallback: number | undefined, flag: string): number | undefined {
+  if (raw === undefined || raw === '') {
+    return fallback;
+  }
+  const parsed = parseInt(raw, 10);
+  if (Number.isNaN(parsed)) {
+    CLIUtils.error(`${flag} 需要是数字，收到: ${raw}`);
+    process.exit(1);
+  }
+  return parsed;
 }
 
 export class ConfigCommands {
@@ -138,60 +157,59 @@ export class ConfigCommands {
 
   private async addServer(args: string[], options: Record<string, any>): Promise<void> {
     const [name, endpoint] = args;
-    
-    console.log('addServer - args:', args);
-    console.log('addServer - options:', options);
 
     if (!name || !endpoint) {
       CLIUtils.error('Usage: mcpdog config add <name> <endpoint> [options]');
-      return;
+      process.exit(1);
     }
 
     try {
       if (options['auto-detect']) {
-        // Use protocol auto-detection
+        // 此前整段被注释掉，却仍然打印「检测完成」并回 {"success":true} —— 纯假成功。
+        // 现接上真正可用的 AutoConfigGenerator（ProtocolDetector 的包装）。
         CLIUtils.info(`🔍 Auto-detecting server protocol: ${endpoint}`);
-        
-        // const suggestion = await this.configManager.generateAutoConfig(name, endpoint, {
-        //   timeout: options.timeout ? parseInt(options.timeout) : undefined
-        // });
 
-        // // Display detection results
-        // if (!CLIUtils.isJsonMode()) {
-        //   CLIUtils.success(`Protocol detection complete (confidence: ${suggestion.confidence}%)`);
-        //   CLIUtils.info(`Recommended protocol: ${suggestion.config.transport}`);
-          
-        //   if (suggestion.warnings.length > 0) {
-        //     CLIUtils.warning('Warnings:');
-        //     suggestion.warnings.forEach(w => CLIUtils.warning(`  - ${w}`));
-        //   }
+        const suggestion = await this.configManager.generateAutoConfigForEndpoint(name, endpoint, {
+          timeout: options.timeout ? parseNumericOption(options.timeout, undefined, '--timeout') : undefined
+        });
 
-        //   if (suggestion.optimizations.length > 0) {
-        //     CLIUtils.info('Optimization suggestions:');
-        //     suggestion.optimizations.forEach(o => CLIUtils.info(`  💡 ${o}`));
-        //   }
-        // }
+        if (!CLIUtils.isJsonMode()) {
+          CLIUtils.success(`Protocol detection complete (confidence: ${suggestion.confidence}%)`);
+          CLIUtils.info(`Recommended protocol: ${suggestion.config.transport}`);
 
-        // // Confirm add
-        // const shouldAdd = options.yes || await CLIUtils.confirm(
-        //   `Add server '${name}' (protocol: ${suggestion.config.transport})?`,
-        //   true
-        // );
+          if (suggestion.warnings.length > 0) {
+            CLIUtils.warning('Warnings:');
+            suggestion.warnings.forEach((w: string) => CLIUtils.warning(`  - ${w}`));
+          }
 
-        // if (shouldAdd) {
-        //   await this.configManager.addServer(name, suggestion.config);
-        //   CLIUtils.success(`✅ Server '${name}' added successfully`);
-          
-        //   // Display alternative configurations
-        //   if (suggestion.alternatives.length > 0 && !CLIUtils.isJsonMode()) {
-        //     CLIUtils.info(`\n💡 Available alternative configurations:`);
-        //     suggestion.alternatives.forEach((alt, index) => {
-        //       CLIUtils.info(`  ${index + 1}. ${alt.transport} - ${alt.description}`);
-        //     });
-        //   }
-        // } else {
-        //   CLIUtils.info('Operation cancelled');
-        // }
+          if (suggestion.optimizations.length > 0) {
+            CLIUtils.info('Optimization suggestions:');
+            suggestion.optimizations.forEach((o: string) => CLIUtils.info(`  💡 ${o}`));
+          }
+        }
+
+        // Confirm add
+        const shouldAdd = options.yes || await CLIUtils.confirm(
+          `Add server '${name}' (protocol: ${suggestion.config.transport})?`,
+          true
+        );
+
+        if (!shouldAdd) {
+          CLIUtils.info('Operation cancelled');
+          return;
+        }
+
+        await this.configManager.addServer(name, suggestion.config);
+        await this.configManager.saveConfig();
+        CLIUtils.success(`✅ Server '${name}' added successfully`);
+
+        // Display alternative configurations
+        if (suggestion.alternatives.length > 0 && !CLIUtils.isJsonMode()) {
+          CLIUtils.info(`\n💡 Available alternative configurations:`);
+          suggestion.alternatives.forEach((alt: any, index: number) => {
+            CLIUtils.info(`  ${index + 1}. ${alt.transport} - ${alt.description}`);
+          });
+        }
 
       } else {
         // Manual configuration mode
@@ -202,8 +220,10 @@ export class ConfigCommands {
           name: name,
           enabled: true,
           transport: transport as any,
-          timeout: options.timeout ? parseInt(options.timeout) : 30000,
-          retries: options.retries ? parseInt(options.retries) : 3
+          // 同上：parseInt 失败会产生 NaN，JSON 序列化成 null 后
+          // 会让整份配置在 PUT /api/config 处永远 400
+          timeout: parseNumericOption(options.timeout, 30000, '--timeout'),
+          retries: parseNumericOption(options.retries, 3, '--retries')
         };
 
         // Set required fields based on protocol type
@@ -225,6 +245,14 @@ export class ConfigCommands {
           if (options.headers) {
             config.headers = JSON.parse(options.headers);
           }
+        }
+
+        // 校验后再落盘：未知 transport 或缺失 command/url 会让该服务器在加载时
+        // 抛错，而此前这里照样报「added successfully」并写进配置。
+        const addErrors = AdapterFactory.validateConfig(config as any);
+        if (addErrors.length > 0) {
+          CLIUtils.error(`服务器定义无效: ${addErrors.join('; ')}`);
+          process.exit(1);
         }
 
         await this.configManager.addServer(name, config);
@@ -257,14 +285,14 @@ export class ConfigCommands {
 
     if (!name) {
       CLIUtils.error('Usage: mcpdog config remove <name>');
-      return;
+      process.exit(1);
     }
 
     try {
       const server = this.configManager.getServer(name);
       if (!server) {
         CLIUtils.error(`服务器 '${name}' 不存在`);
-        return;
+        process.exit(1);
       }
 
       const shouldRemove = options.yes || await CLIUtils.confirm(
@@ -274,6 +302,9 @@ export class ConfigCommands {
 
       if (shouldRemove) {
         await this.configManager.removeServer(name);
+        // ConfigManager 的变更方法只改内存并 emit，落盘必须由调用方完成；
+        // 每个 CLI 都是独立进程，漏掉这一步改动会在退出时静默丢失
+        await this.configManager.saveConfig();
         CLIUtils.success(`✅ 服务器 '${name}' 删除成功`);
       } else {
         CLIUtils.info('操作已取消');
@@ -290,14 +321,14 @@ export class ConfigCommands {
 
     if (!name) {
       CLIUtils.error('使用方法: mcpdog config update <name> [options]');
-      return;
+      process.exit(1);
     }
 
     try {
       const server = this.configManager.getServer(name);
       if (!server) {
         CLIUtils.error(`服务器 '${name}' 不存在`);
-        return;
+        process.exit(1);
       }
 
       const updates: Partial<MCPServerConfig> = {};
@@ -305,8 +336,12 @@ export class ConfigCommands {
       // 从选项中构建更新对象
       if (options.endpoint) updates.endpoint = options.endpoint;
       if (options.transport) updates.transport = options.transport;
-      if (options.timeout) updates.timeout = parseInt(options.timeout);
-      if (options.retries) updates.retries = parseInt(options.retries);
+      if (options.timeout) {
+        updates.timeout = parseNumericOption(options.timeout, undefined, '--timeout')!;
+      }
+      if (options.retries) {
+        updates.retries = parseNumericOption(options.retries, undefined, '--retries')!;
+      }
       if (options.description) updates.description = options.description;
 
       if (Object.keys(updates).length === 0) {
@@ -314,7 +349,33 @@ export class ConfigCommands {
         return;
       }
 
+      // 校验必须在**落盘前**、针对「合并后的真实结果」进行 —— 这是唯一能改
+      // transport 的 CLI 路径，而 updateServer 会在切换传输时清掉不适用的字段
+      // （改成 http 会删掉 command，改成 stdio 会删掉 url）。不校验的话
+      // `config update <name> --transport bogus` 会以 exit 0 报「更新成功」并写下
+      // 一个永久加载不了的条目，甚至让 PUT /api/config 从此对该配置永远 400。
+      // 这里先快照，再用 updateServer 自己的合并语义取结果校验，不合规则回滚。
+      const snapshot = JSON.parse(JSON.stringify(this.configManager.getConfig()));
       await this.configManager.updateServer(name, updates);
+
+      const mergedName = updates.name || name;
+      const merged = this.configManager.getServer(mergedName);
+      // 与 API 侧一致地注入 name 兜底：loadConfig 接受没有 name 字段的条目
+      // （只校验「是对象」），API 侧用 name 兜底后能正常更新；CLI 若不兜底，
+      // 就会以「Server name is required」拒绝一个 API 完全接受的更新。
+      const updateErrors = merged
+        ? AdapterFactory.validateConfig({ ...merged, name: (merged as any).name || mergedName } as any)
+        : [`更新后找不到服务器 '${mergedName}'`];
+
+      if (updateErrors.length > 0) {
+        // 回滚到更新前，避免把非法条目留在内存里（随后可能被别的路径落盘）
+        this.configManager.setConfig(snapshot);
+        CLIUtils.error(`服务器定义无效，未做任何修改: ${updateErrors.join('; ')}`);
+        process.exit(1);
+      }
+
+      // 同上：变更方法不落盘，漏掉则本次更新在进程退出后丢失
+      await this.configManager.saveConfig();
       CLIUtils.success(`✅ 服务器 '${name}' 更新成功`);
 
       if (!CLIUtils.isJsonMode()) {
@@ -335,13 +396,13 @@ export class ConfigCommands {
 
     if (!name) {
       CLIUtils.error('使用方法: mcpdog config show <name>');
-      return;
+      process.exit(1);
     }
 
     const server = this.configManager.getServer(name);
     if (!server) {
       CLIUtils.error(`服务器 '${name}' 不存在`);
-      return;
+      process.exit(1);
     }
 
     if (CLIUtils.isJsonMode()) {
@@ -372,11 +433,17 @@ export class ConfigCommands {
 
     if (!name) {
       CLIUtils.error('使用方法: mcpdog config enable <name>');
-      return;
+      process.exit(1);
     }
 
     try {
-      await this.configManager.toggleServer(name, true);
+      // toggleServer 对不存在的服务器返回 false（不抛错），此前被忽略 →「已启用」是假成功
+      const toggled = this.configManager.toggleServer(name, true);
+      if (!toggled) {
+        CLIUtils.error(`服务器 '${name}' 不存在`);
+        process.exit(1);
+      }
+      await this.configManager.saveConfig();
       CLIUtils.success(`✅ 服务器 '${name}' 已启用`);
     } catch (error) {
       CLIUtils.error(`启用服务器失败: ${(error as Error).message}`);
@@ -389,11 +456,16 @@ export class ConfigCommands {
 
     if (!name) {
       CLIUtils.error('使用方法: mcpdog config disable <name>');
-      return;
+      process.exit(1);
     }
 
     try {
-      await this.configManager.toggleServer(name, false);
+      const toggled = this.configManager.toggleServer(name, false);
+      if (!toggled) {
+        CLIUtils.error(`服务器 '${name}' 不存在`);
+        process.exit(1);
+      }
+      await this.configManager.saveConfig();
       CLIUtils.success(`✅ 服务器 '${name}' 已禁用`);
     } catch (error) {
       CLIUtils.error(`禁用服务器失败: ${(error as Error).message}`);

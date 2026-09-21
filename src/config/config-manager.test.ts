@@ -11,12 +11,19 @@ vi.mock('fs', () => ({
       mkdir: vi.fn(),
     },
   },
+  // shouldAutoCreateConfig 用同步 API 在目标目录做可写探测
+  existsSync: vi.fn(() => false),
+  mkdirSync: vi.fn(),
+  writeFileSync: vi.fn(),
+  unlinkSync: vi.fn(),
 }));
 
 vi.mock('fs/promises', () => ({
   readFile: vi.fn(),
   writeFile: vi.fn(),
   mkdir: vi.fn(),
+  rename: vi.fn(),
+  unlink: vi.fn(),
 }));
 
 describe('ConfigManager', () => {

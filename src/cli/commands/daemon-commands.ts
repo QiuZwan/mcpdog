@@ -31,20 +31,39 @@ const GRACEFUL_SHUTDOWN_POLL_INTERVAL_MS = 250;
 
 /**
  * 读取某 PID 的命令行，用于判定该进程是不是我们的 daemon。
- * 非 Windows 或读取失败时返回 null —— 表示「无法确认」，调用方须按此处理而不是当成「不是我们」。
+ * 读不到时返回 null —— 表示「无法确认」，调用方须按此处理而不是当成「不是我们」。
+ *
+ * POSIX 上用 `ps -p <pid> -o args=` 取同一信息。此前非 Windows 直接返回 null，
+ * 于是调用方（把 null 当作「无法确认 → 按已在运行处理」）会把**任何**复用了该 PID
+ * 的无关进程认定成我们的 daemon：版本相同则永久拒绝启动，版本不同更糟，
+ * 会去 SIGKILL 一个无关进程。
  */
 export async function readProcessCommandLine(pid: number): Promise<string | null> {
-  if (process.platform !== 'win32') return null;
+  if (process.platform === 'win32') {
+    return new Promise((resolve) => {
+      execFile(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`,
+        ],
+        { windowsHide: true, timeout: 5000 },
+        (error, stdout) => {
+          if (error) return resolve(null);
+          const line = String(stdout || '').trim();
+          resolve(line ? line : null);
+        },
+      );
+    });
+  }
+
   return new Promise((resolve) => {
     execFile(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`,
-      ],
-      { windowsHide: true, timeout: 5000 },
+      'ps',
+      ['-p', String(pid), '-o', 'args='],
+      { timeout: 5000 },
       (error, stdout) => {
         if (error) return resolve(null);
         const line = String(stdout || '').trim();
@@ -88,7 +107,10 @@ export class DaemonCommands {
   private async isPortAvailable(port: number): Promise<boolean> {
     return new Promise((resolve) => {
       const server = createServer();
-      server.listen(port, 'localhost', () => {
+      // 必须与 dashboard 的真实绑定地址一致（daemon-web-server 监听 127.0.0.1）。
+      // 用 'localhost' 时 Node 先解析到 ::1，与已占用 127.0.0.1:port 不冲突，
+      // 于是繁忙端口被判为可用，随后绑定必然 EADDRINUSE。
+      server.listen(port, '127.0.0.1', () => {
         server.close();
         resolve(true);
       });
@@ -117,7 +139,7 @@ export class DaemonCommands {
   private async reservePort(port: number): Promise<boolean> {
     return new Promise((resolve) => {
       const server = createServer();
-      server.listen(port, 'localhost', () => {
+      server.listen(port, '127.0.0.1', () => {
         // Keep the server running to reserve the port
         resolve(true);
       });
@@ -232,6 +254,22 @@ export class DaemonCommands {
         process.exit(1);
       }
 
+      // 强杀兜底会 taskkill /F /T（POSIX 上 SIGKILL）一个按 PID 取到的进程，必须确认它确实是
+      // 我们的 daemon：PID 文件在非正常终止时不会被清理，重启后该 PID 很容易被别的程序复用，
+      // 不校验就会杀掉一个无关进程。（start 路径一直有这层校验，stop/restart 此前漏了。）
+      if (!(await this.isConfirmedOurDaemon(pid))) {
+        CLIUtils.warn(
+          `PID ${pid} 不是 MCPDog daemon（可能是复用了该 PID 的无关进程）。` +
+          '仅清理陈旧 PID 文件，不做任何终止操作。'
+        );
+        try {
+          await fs.unlink(pidFile);
+        } catch {
+          // PID 文件已不存在则忽略
+        }
+        process.exit(1);
+      }
+
       const graceful = await this.stopDaemonByPid(pid, port);
 
       if (!graceful) {
@@ -257,14 +295,9 @@ export class DaemonCommands {
 
     const info = await this.getDaemonInfoFromFile(pidFile);
     if (info) {
-      let running = false;
-      try {
-        process.kill(info.pid, 0);
-        running = true;
-      } catch {
-        running = false;
-      }
-      if (running) {
+      // 与 stop 同样必须校验身份：这里的结果同样会走到 forceKill。
+      // 此前用裸 process.kill(info.pid, 0) 判存活，等于放弃识别。
+      if (await this.isConfirmedOurDaemon(info.pid)) {
         CLIUtils.info(`Stopping daemon (PID: ${info.pid})...`);
         await this.stopDaemonByPid(info.pid, parseInt(options['daemon-port']) || 9999);
         try {
@@ -273,6 +306,15 @@ export class DaemonCommands {
           // PID 文件不存在则忽略
         }
         CLIUtils.success('Daemon stopped');
+      } else {
+        CLIUtils.warn(
+          `PID ${info.pid} 不是 MCPDog daemon（可能是复用了该 PID 的无关进程），仅清理陈旧 PID 文件。`
+        );
+        try {
+          await fs.unlink(pidFile);
+        } catch {
+          // PID 文件不存在则忽略
+        }
       }
     }
 
@@ -413,6 +455,13 @@ export class DaemonCommands {
         silent: true
       });
 
+      // EventEmitter 对无人监听的 'error' 会直接抛出（process 级 uncaughtException
+      // → CLI 的 handler 立即 exit(1)）。连接中途 daemon 退出即触发，必须兜底。
+      client.on('error', () => {
+        // connect() 阶段的错误由它自己的 once('error') 处理；
+        // 此处兜住其后的运行时错误（如请求途中 daemon 退出导致的 ECONNRESET）
+      });
+
       await client.connect();
       
       client.on('status', (status) => {
@@ -542,6 +591,13 @@ ${CLIUtils.colorize('Quick Start:', 'cyan')}
         reconnect: false
       });
 
+      // EventEmitter 对无人监听的 'error' 会直接抛出（process 级 uncaughtException
+      // → CLI 的 handler 立即 exit(1)）。连接中途 daemon 退出即触发，必须兜底。
+      client.on('error', () => {
+        // connect() 阶段的错误由它自己的 once('error') 处理；
+        // 此处兜住其后的运行时错误（如请求途中 daemon 退出导致的 ECONNRESET）
+      });
+
       await client.connect();
       
       client.reloadConfig();
@@ -580,6 +636,32 @@ ${CLIUtils.colorize('Quick Start:', 'cyan')}
    * 读不到命令行时返回 true（无法确认身份，保持保守行为）并记日志；
    * 只有明确读到「不是我们的 daemon」才忽略该 PID 记录并清掉陈旧文件。
    */
+  /**
+   * 严格身份判定：只有**确证**命令行属于我们的 daemon 才返回 true。
+   *
+   * 与 isOurDaemonRunning 的区别在「读不到命令行」这一档，两者必须相反：
+   * - start 关心的是「别起第二个 daemon」，读不到就当已在运行 → 拒绝启动，不动任何进程，安全。
+   * - stop/restart 会 taskkill /F /T 或 SIGKILL，读不到就当在运行 → 可能杀掉无关进程，破坏性。
+   *   故这里在无法确认时返回 false（只清理陈旧 PID 文件，不做终止）。
+   */
+  private async isConfirmedOurDaemon(pid: number): Promise<boolean> {
+    let alive = false;
+    try {
+      process.kill(pid, 0);
+      alive = true;
+    } catch {
+      alive = false;
+    }
+    if (!alive) return false;
+
+    const commandLine = await readProcessCommandLine(pid);
+    if (commandLine === null || !commandLine.trim()) {
+      CLIUtils.warn(`PID ${pid} 存活但读不到命令行，无法确认身份；不做终止操作`);
+      return false;
+    }
+    return looksLikeOurDaemon(commandLine);
+  }
+
   private async isOurDaemonRunning(pid: number, pidFile: string): Promise<boolean> {
     let alive = false;
     try {
