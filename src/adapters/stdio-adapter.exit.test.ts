@@ -145,13 +145,15 @@ describe('StdioAdapter：子进程退出时的失败原因', () => {
     expect(uncaught, `不得出现进程级未处理错误：${uncaught.join(' | ')}`).toEqual([]);
   }, 30000);
 
-  it('迟到的旧进程 exit 不得打回新连接的状态', async () => {
+  it('迟到的旧进程 exit 不得打回新连接的状态，也不得打断新连接的在途请求', async () => {
     // 真实时序：cleanup() 用异步 taskkill / 延迟 SIGKILL 杀旧进程后立即把 this.process
-    // 置空，而恢复只等 1s 就拉起新进程 —— 旧进程的 exit 常在新进程已 connected 之后
-    // 才送达。不校验「这是不是当前进程」的话，这个迟到的 exit 会把健康的新连接标成
-    // isConnected=false、发出 disconnected，还会再排一轮恢复把新进程也杀掉。
-    // 子进程：一个最小 MCP 服务，回 initialize 后保持存活。
-    // 用数组 join 组装，避免在测试文件里嵌套转义换行符
+    // 置空，而重连只等一小会儿就拉起新进程 —— 旧进程的 exit 常在新进程已连接、
+    // 甚至有请求在途时才送达。
+    //
+    // 关键点：进程身份校验必须是 exit 处理器的**第一件事**。若先跑「拒绝所有在途请求」，
+    // 那个迟到的 exit 会用旧进程的退出原因把**新连接**的握手/请求打断
+    // （Linux 上实测稳定复现：新连接以「子进程已退出 (signal=SIGTERM)」失败）。
+    // 这里用「新连接上有在途请求时投递旧 exit」把它确定性地复现出来。
     const NL = String.fromCharCode(10);
     const childScript = [
       'let buf = "";',
@@ -165,7 +167,7 @@ describe('StdioAdapter：子进程退出时的失败原因', () => {
       '    let m;',
       '    try { m = JSON.parse(line); } catch { continue; }',
       '    if (m.id !== undefined) {',
-      '      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: {} }) + String.fromCharCode(10));',
+      '      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { tools: [] } }) + String.fromCharCode(10));',
       '    }',
       '  }',
       '});',
@@ -196,9 +198,12 @@ describe('StdioAdapter：子进程退出时的失败原因', () => {
     let disconnectedAfterReconnect = 0;
     adapter.on('disconnected', () => disconnectedAfterReconnect++);
 
-    // 旧进程的 exit 迟到送达（真实场景由 taskkill 的异步性造成）
+    // 新连接上发起一个在途请求，同时投递旧进程的 exit
+    const inFlight = adapter.getTools();
     stale.emit('exit', null, 'SIGTERM');
-    await new Promise((r) => setTimeout(r, 150));
+
+    // 在途请求必须照常完成（不得被旧进程的退出原因拒掉）
+    await expect(inFlight).resolves.toBeDefined();
 
     // 新连接的状态不得被这个迟到事件打回
     expect(adapter.isConnected).toBe(true);

@@ -286,6 +286,23 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
     this.process.on('exit', (code: number | null, signal: string | null) => {
       console.error(`[${this.name}] DEBUG: Process exited with code ${code}, signal ${signal}.`);
       console.error(`[${this.name}] DEBUG: Pending requests at exit: ${this.pendingRequests.size}`);
+
+      // 必须是「当前这个进程」的退出事件，迟到的旧进程 exit 一律忽略 ——
+      // 这必须是处理器的**第一件事**，任何对共享状态的改动都要排在它之后。
+      //
+      // cleanup() 用异步 taskkill / 延迟 SIGKILL 杀旧进程后立刻把 this.process 置空，
+      // 而重连只等一小会儿就拉起新进程，所以旧进程的 exit 常常在新进程已经握手到一半
+      // 时才送达。此时 pendingRequests 里装的是**新进程**的 initialize 请求：
+      // 若先跑「拒绝所有在途请求」，就会用旧进程的退出原因把新连接的握手打断
+      // （实测 Linux 上稳定复现：`Pending requests at exit: 1` 出现在本判定之前，
+      // 新连接随即以「子进程已退出 (signal=SIGTERM)」失败）。
+      // 不校验身份还会顺带把健康的新连接标成断开、发出 disconnected，
+      // 并再排一轮恢复把新进程也杀掉：一次「重启该服务器」变成 3 个进程。
+      if (this.process !== proc) {
+        console.error(`[${this.name}] Ignoring exit from superseded process (pid ${proc.pid})`);
+        return;
+      }
+
       globalLogManager.addLog(this.name, 'error', `Process exited with code ${code}, signal ${signal}`, 'system');
 
       // 立即以「退出码 + 它最后的 stderr」拒绝所有在途请求。
@@ -296,18 +313,6 @@ export class StdioAdapter extends EventEmitter implements ServerAdapter {
         this.pendingRequests.delete(id);
         clearTimeout(pending.timeout);
         pending.reject(new Error(exitReason));
-      }
-
-      // 必须是「当前这个进程」的退出事件，迟到的旧进程 exit 一律忽略。
-      //
-      // cleanup() 用异步 taskkill / 延迟 SIGKILL 杀旧进程后就立刻把 this.process
-      // 置空，而 attemptRecovery 只等 1s 就拉起新进程 —— 旧进程的 exit 常常在新进程
-      // 已经 connected 之后才送达。不做校验的话，这个迟到的 exit 会把健康的新连接
-      // 标成 isConnected=false、发出 disconnected（工具从 tools/list 消失），
-      // 还会再排一轮恢复把新进程也杀掉：一次「重启该服务器」变成 3 个进程。
-      if (this.process !== proc) {
-        console.error(`[${this.name}] Ignoring exit from superseded process (pid ${proc.pid})`);
-        return;
       }
 
       // Log crash history
