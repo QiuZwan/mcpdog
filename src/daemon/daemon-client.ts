@@ -43,7 +43,7 @@ export class DaemonClient extends EventEmitter {
   private setupSocket() {
     this.socket.on('connect', () => {
       if (!this.config.silent) {
-        console.log('[DAEMON-CLIENT] Connected to daemon');
+        console.error('[DAEMON-CLIENT] Connected to daemon');
       }
       this.isConnected = true;
       this.clearReconnectTimer();
@@ -81,7 +81,7 @@ export class DaemonClient extends EventEmitter {
 
     this.socket.on('close', () => {
       if (!this.config.silent) {
-        console.log('[DAEMON-CLIENT] Disconnected from daemon');
+        console.error('[DAEMON-CLIENT] Disconnected from daemon');
       }
       this.isConnected = false;
 
@@ -109,14 +109,14 @@ export class DaemonClient extends EventEmitter {
     switch (message.type) {
       case 'welcome':
         if (!this.config.silent) {
-          console.log(`[DAEMON-CLIENT] Welcome, client ID: ${message.clientId}`);
+          console.error(`[DAEMON-CLIENT] Welcome, client ID: ${message.clientId}`);
         }
         this.emit('welcome', message);
         break;
 
       case 'handshake-ack':
         if (!this.config.silent) {
-          console.log('[DAEMON-CLIENT] Handshake acknowledged');
+          console.error('[DAEMON-CLIENT] Handshake acknowledged');
         }
         this.emit('ready', message.serverStatus);
         break;
@@ -201,7 +201,7 @@ export class DaemonClient extends EventEmitter {
     if (this.reconnectTimer) return;
     
     if (!this.config.silent) {
-      console.log(`[DAEMON-CLIENT] Scheduling reconnect in ${this.config.reconnectInterval}ms`);
+      console.error(`[DAEMON-CLIENT] Scheduling reconnect in ${this.config.reconnectInterval}ms`);
     }
     this.reconnectTimer = setTimeout(() => {
       // 必须先清掉自己：这个字段同时是「是否有重连在排队」的判据（见上面的守卫），
@@ -211,7 +211,7 @@ export class DaemonClient extends EventEmitter {
       this.reconnectTimer = undefined;
 
       if (!this.config.silent) {
-        console.log('[DAEMON-CLIENT] Attempting to reconnect...');
+        console.error('[DAEMON-CLIENT] Attempting to reconnect...');
       }
       // 必须接住 rejection：connect() 在 daemon 不可达时 reject，裸调用会成为
       // process 级 unhandledRejection，而 CLI 的 handler 是 process.exit(1) ——

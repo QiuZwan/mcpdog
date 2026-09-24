@@ -81,9 +81,9 @@ export class MCPDogServer extends EventEmitter {
 
       // If it's a server or tool related toggle, skip full reinitialization
       if (changeType === 'server-toggle') {
-        console.log(`[SERVER] Skipping adapter reinitialization for server toggle: ${serverName}`);
+        console.error(`[SERVER] Skipping adapter reinitialization for server toggle: ${serverName}`);
       } else if (changeType === 'tool-toggle' || changeType === 'tool-config-update') {
-        console.log(`[SERVER] Skipping adapter reinitialization for tool update on: ${serverName}`);
+        console.error(`[SERVER] Skipping adapter reinitialization for tool update on: ${serverName}`);
       } else {
         this.handleConfigUpdate().catch((error: any) => {
           console.error('Error handling config update:', error);
@@ -426,7 +426,7 @@ export class MCPDogServer extends EventEmitter {
   }
 
   async updateServerTools(serverName: string): Promise<void> {
-    console.log(`[SERVER] Updating tools for server: ${serverName}`);
+    console.error(`[SERVER] Updating tools for server: ${serverName}`);
     await this.toolRouter.updateServerTools(serverName);
     this.notifyToolsChanged().catch(error => {
       console.error(`Error notifying tools changed after tool update for ${serverName}:`, error);

@@ -852,7 +852,7 @@ export class ToolRouter extends EventEmitter {
   }
 
   async updateServerTools(serverName: string): Promise<void> {
-    console.log(`[ROUTER] Updating tools for server: ${serverName}`);
+    console.error(`[ROUTER] Updating tools for server: ${serverName}`);
     await this.refreshToolRoutes(serverName);
   }
 }
