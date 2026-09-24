@@ -175,22 +175,22 @@ fn check_update(app: &AppHandle) {
                     .buttons(MessageDialogButtons::Ok)
                     .show(|_| {});
             }
-            // 有新版本：用户确认后先停 daemon（释放内嵌 node.exe 的镜像锁，
-            // 否则 NSIS 覆盖安装必弹「文件被占用」—— 见 doc/bug-diagnosis-
-            // node-exe-locked-during-update-20260924.md），再打开下载链接。
-            // 停机必须离开当前线程：stop_for_update 持 SUPERVISOR 锁，内含最长 15s
-            // 的优雅停机轮询与可能的 30s 强杀等待，阻塞异步运行时线程会拖死其他任务。
+            // 有新版本：用户确认后静默更新 —— 停 daemon 释放内嵌 node.exe 的镜像锁
+            // （见 doc/bug-diagnosis-node-exe-locked-during-update-20260924.md），
+            // 然后 download_and_install：下载、验签、以 /S /UPDATE 静默运行 NSIS、
+            // 装完 /R 自动重启本壳。/UPDATE 模式下模板保留 Run 键自启值，
+            // 因此开机自启不丢，全程无浏览器、无安装向导。
+            // 重活全部离开当前线程：stop_for_update 持 SUPERVISOR 锁（最长分钟级），
+            // 下载在异步运行时做，安装的 ExecWait 由 updater 插件自己管理。
             Ok(Some(update)) => {
-                let url = update.download_url.to_string();
+                let target = update.version.clone();
                 app.dialog()
                     .message(format!(
-                        "发现新版本 v{}（当前 v{current}）。\n\n\
-                         点「确定」后将：\n\
-                         1. 停止 MCPDog 服务（释放更新所需的文件，期间 MCP 客户端暂时不可用）；\n\
-                         2. 打开下载链接。\n\n\
-                         下载完成后直接运行安装包即可完成更新，新版启动后会自动恢复服务。\n\
-                         {url}",
-                        update.version
+                        "发现新版本 v{target}（当前 v{current}）。\n\n\
+                         点「确定」后将自动完成更新：\n\
+                         1. 停止 MCPDog 服务（期间 MCP 客户端暂时不可用）；\n\
+                         2. 下载并静默安装新版本（无需手动操作）；\n\
+                         3. 安装完成后自动重启并恢复服务，开机自启设置保持不变。"
                     ))
                     .title("检查更新")
                     .kind(MessageDialogKind::Info)
@@ -200,25 +200,55 @@ fn check_update(app: &AppHandle) {
                             return;
                         }
                         let app = app.clone();
-                        let url = url.clone();
                         std::thread::spawn(move || {
                             if !supervisor::stop_for_update() {
                                 eprintln!("[tray] 更新前停机有残留进程，由安装器钩子兜底");
                             }
-                            if let Err(e) = tauri_plugin_opener::open_url(&url, None::<&str>) {
-                                eprintln!("[tray] 打开下载链接失败: {e}");
-                            }
-                            app.dialog()
-                                .message(
-                                    "服务已停止，下载页面已在浏览器打开。\n\n\
-                                     下载完成后直接运行安装包（无需手动退出程序）；\n\
-                                     新版安装完成并启动后服务自动恢复。\n\n\
-                                     如需暂时取消更新，可在托盘菜单点「重启服务」。",
-                                )
-                                .title("MCPDog 更新")
-                                .kind(MessageDialogKind::Info)
-                                .buttons(MessageDialogButtons::Ok)
-                                .show(|_| {});
+                            // download_and_install 需要在 async 上下文执行：
+                            // 回到 tauri 异步运行时做下载与安装（壳随后会被安装器结束）
+                            tauri::async_runtime::spawn(async move {
+                                let updater = match app.updater() {
+                                    Ok(u) => u,
+                                    Err(e) => {
+                                        show_silent_update_error(&app, &format!("updater 初始化失败: {e}"));
+                                        return;
+                                    }
+                                };
+                                // 重新 check 拿到待装对象：确认弹窗期间远端可能已变化
+                                let update = match updater.check().await {
+                                    Ok(Some(u)) if u.version == target => u,
+                                    Ok(Some(u)) => {
+                                        show_silent_update_error(
+                                            &app,
+                                            &format!("远端版本已变化（{} != {target}），请重新检查更新", u.version),
+                                        );
+                                        return;
+                                    }
+                                    Ok(None) => {
+                                        show_silent_update_error(&app, "远端已无此版本，请重新检查更新");
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        show_silent_update_error(&app, &format!("下载前检查失败: {e}"));
+                                        return;
+                                    }
+                                };
+                                eprintln!("[tray] 静默更新：开始下载 v{} ...", update.version);
+                                if let Err(e) = update
+                                    .download_and_install(
+                                        |_chunk, _total| {},
+                                        || eprintln!("[tray] 静默更新：下载完成，验签并安装..."),
+                                    )
+                                    .await
+                                {
+                                    // 安装失败壳还活着：弹窗说明，daemon 可用托盘「重启服务」拉回
+                                    show_silent_update_error(&app, &format!("下载/安装失败: {e}"));
+                                    return;
+                                }
+                                // 成功路径不会走到这里：updater 在 Windows 上运行静默安装器
+                                // 并结束本进程，由安装器 /R 重启新版本
+                                eprintln!("[tray] 静默更新安装完成");
+                            });
                         });
                     });
             }
@@ -235,6 +265,22 @@ fn show_check_error(app: &AppHandle, reason: &str) {
     app.dialog()
         .message(format!("检查更新失败：\n{reason}"))
         .title("检查更新")
+        .kind(MessageDialogKind::Error)
+        .buttons(MessageDialogButtons::Ok)
+        .show(|_| {});
+}
+
+/// 静默更新失败的弹窗。此时 daemon 已被停掉：文案必须告诉用户怎么把服务拉回来。
+fn show_silent_update_error(app: &AppHandle, reason: &str) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+    app.dialog()
+        .message(format!(
+            "自动更新失败：\n{reason}\n\n\
+             服务当前已停止：可在托盘菜单点「重启服务」恢复；\n\
+             也可到 Releases 页面手动下载安装包更新。"
+        ))
+        .title("MCPDog 更新")
         .kind(MessageDialogKind::Error)
         .buttons(MessageDialogButtons::Ok)
         .show(|_| {});
