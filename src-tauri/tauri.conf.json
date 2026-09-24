@@ -29,7 +29,8 @@
       "nsis": {
         "languages": [
           "SimpChinese"
-        ]
+        ],
+        "installerHooks": "./installer-hooks.nsh"
       }
     }
   },
