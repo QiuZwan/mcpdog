@@ -149,7 +149,7 @@ export class ConfigCommands {
       server.enabled ? CLIUtils.colorize('Enabled', 'green') : CLIUtils.colorize('Disabled', 'red'),
       server.transport,
       server.endpoint || server.command || '-',
-      'Pending Detection' // TODO: Actual tool count
+      '-' // 工具数需连 daemon 拉取，见 diagnose --health-check
     ]);
 
     CLIUtils.printTable(headers, rows);
